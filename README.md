@@ -1,5 +1,3 @@
-# README.md
-
 # Event-based Temporal Action Detection (TFG)
 
 👉 **Galician version:** [README.gl.md](README.gl.md)
