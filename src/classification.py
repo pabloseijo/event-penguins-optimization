@@ -143,7 +143,7 @@ class ProposalClassifier:
 
         self.data_path = data_path
         self.model = AugmentedTsn(2, num_tsn_samples, augment_factor)
-        self.model.load_state_dict(torch.load(model_path))
+        self.model.load_state_dict(torch.load(model_path,map_location=device)) # TODO: cambiar de volta a cuda eliminando map_location
         self.model.to(device).eval()
 
         self.sample_duration = 1e6 * sample_duration  # [s] -> [us]
