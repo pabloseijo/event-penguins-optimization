@@ -1,5 +1,3 @@
-# README.gl.md
-
 # Event-based Temporal Action Detection (TFG)
 
 Este repositorio contén unha reprodución e extensión dun pipeline de detección temporal de accións baseado en cámaras de eventos, tomando como base o repositorio orixinal *event_penguins* e o método publicado por Hamann et al. en CVPR 2024. O repositorio orixinal estrutura o proxecto en `config/`, `docs/`, `scripts/`, `src/`, `requirements.txt` e un fluxo de uso baseado en preprocesado e inferencia. :contentReference[oaicite:0]{index=0} O paper define un pipeline en dúas etapas: xeración de propostas temporais e clasificación posterior mediante CNN. :contentReference[oaicite:1]{index=1}
