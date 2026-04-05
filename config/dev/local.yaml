@@ -16,5 +16,10 @@ retag:
   nms_threshold: 0.95
   min_proposal_duration_s: 2.0
 
+proposals:
+  bin_width: 0.033
+  percentile: 1
+  use_adaptive_lambda: false
+
 profiling:
   enabled: true

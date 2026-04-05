@@ -7,12 +7,15 @@ from absl import logging
 import pandas as pd
 import h5py
 
-from .utils import temporal_nms
+from src.utils import temporal_nms
 
+def log_to_txt(file_path, text):
+    with open(file_path, "a") as f:
+        f.write(text + "\n")
 
 def get_event_rate(events, bin_width):
     '''
-    events: é un array de dimensión (n_events, 3) onde cada fila é un evento e as columnas son [x, y, t], sendo x e y as coordenadas do evento e t o tempo do evento en microsegundos.
+    events: é un array de dimensión (n_events, 4) onde cada fila é un evento e as columnas son [x, y, t, p], sendo x e y as coordenadas do evento e t o tempo do evento en microsegundos.
     bin_width: ancho do bin para calcular a taxa de eventos, en microsegundos. Por exemplo, se queremos calcular a taxa de eventos cada 10 ms, o ancho do bin sería 10 * 1e3 = 1e4 microsegundos.
     '''
  
@@ -244,6 +247,47 @@ def merge_proposals(unmerged, score, grouping_thres, times):
 
     return merged
 
+def get_adaptive_actioness_thresholds(actioness, central_percentile=80, delta=0.10, step=0.05):
+    """
+    Calcula un conxunto pequeno de thresholds adaptados á distribución do actioness.
+
+    Parámetros
+    ----------
+    actioness : np.ndarray
+        Sinal normalizado en [0, 1].
+    central_percentile : float
+        Percentil central usado para estimar lambda.
+    delta : float
+        Marxe arredor do lambda central.
+    step : float
+        Paso entre thresholds.
+
+    Retorna
+    -------
+    np.ndarray
+        Array cos thresholds adaptativos.
+    """
+    
+    # Calculamos cal é o valor do actioness correspondente ao percentil. 
+    lambda_center = np.percentile(actioness, central_percentile)
+
+    # Como queremos xerar un conxunto pequeno, xeneramos thresholds arredor dese valor central, 
+    # nun rango definido por delta, e cun paso definido por step. Por exemplo, se lambda_center 
+    # é 0.6, delta é 0.10 e step é 0.05, xeneraríamos thresholds en [0.5, 0.55, 0.6, 0.65, 0.7], 
+    # pero se lambda_center é 0.2, xeneraríamos thresholds en [0.1, 0.15, 0.2, 0.25, 0.3].
+    thresholds = np.arange(
+        lambda_center - delta,
+        lambda_center + delta + 1e-9, # 1e-9 para asegurar que se inclúe o límite superior cando se xenera o array con np.arange, por fallos cos flotantes
+        step
+    )
+
+    # Aseguramos que os thresholds están dentro do rango [0.05, 0.95] 
+    # para evitar valores extremos que poidan xerar demasiados ou poucos segmentos.
+    # E por último eliminamos duplicados. 
+    thresholds = np.clip(thresholds, 0.05, 0.95)
+    thresholds = np.unique(np.round(thresholds, 4))
+
+    return thresholds
 
 class ProposalGenerator:
     """
@@ -257,12 +301,32 @@ class ProposalGenerator:
         nms_threshold (float): Threshold for non-maximal suppression.
     """
 
-    def __init__(self, data_path, bin_width, percentile, nms_threshold) -> None:
+    def __init__(self, data_path, bin_width, percentile, nms_threshold, use_adaptive_lambda=False) -> None:
+        if use_adaptive_lambda:
+            self.log_file = os.path.join("output", "retag_adaptive_full.txt")
+        else:
+            self.log_file = os.path.join("output", "retag_baseline_full.txt")
+
+        with open(self.log_file, "w") as f:
+            if use_adaptive_lambda:
+                f.write("=== RUN RETAG ADAPTIVE ===\n")
+            else:
+                f.write("=== RUN RETAG BASELINE ===\n")
+            
         self.data_path = data_path
         self.bin_width = bin_width * 1e6  # us
+        
+        self.use_adaptive_lambda = use_adaptive_lambda
+        
         self.percentile = percentile
         self.nms_threshold = nms_threshold
+        
         self.actioness_thresholds = np.arange(0.05, 1, 0.05)
+        
+        self.lambda_percentile = 80
+        self.lambda_delta = 0.10
+        self.lambda_step = 0.05
+
         self.grouping_thresholds = np.arange(0.05, 1, 0.05)
 
     def process_recording(self, rec):
@@ -273,64 +337,105 @@ class ProposalGenerator:
             rec (str): The name of the recording to process.
 
         Returns:
-            pd.DataFrame: A dataframe with proposals.
+            dict: Dictionary with ROI ids as keys and proposal arrays as values.
         """
         rec_proposal_data = {}
 
+        log_to_txt(self.log_file, f"\n[RECORDING] {rec}")
+
         with h5py.File(self.data_path, "r") as file:
             data = file[rec]
-
             roi_ids = data.keys()
-
-            actioness_scores = {}
 
             for roi_id in roi_ids:
                 events = np.array(data[roi_id]["events"])
 
+                log_to_txt(self.log_file, f"\n[ROI] {roi_id}")
+                log_to_txt(self.log_file, f"n_events: {len(events)}")
+
                 rate, bins = get_event_rate(events, self.bin_width)
                 rate = apply_robust_min_max(rate, self.percentile)
 
-                min_rate, max_rate = np.min(rate), np.max(rate)
-                
-                # rate é un array, mentres que o resto son números, pero o que fai python é aplicala operación a cada 
-                # elemento do array, polo que o resultado é un array do mesmo tamaño que rate pero con cada elemento transformado
-                actioness = (rate - min_rate) / (max_rate - min_rate) 
+                log_to_txt(self.log_file, f"rate min/max: {rate.min()} / {rate.max()}")
+                log_to_txt(self.log_file, f"rate mean: {rate.mean():.4f}")
 
-                actioness_scores[roi_id] = actioness
+                min_rate, max_rate = np.min(rate), np.max(rate)
+
+                # Protección contra división por cero
+                if max_rate == min_rate:
+                    actioness = np.zeros_like(rate, dtype=np.float64)
+                else:
+                    actioness = (rate - min_rate) / (max_rate - min_rate)
+
+                log_to_txt(
+                    self.log_file,
+                    f"actioness min/max: {actioness.min():.4f} / {actioness.max():.4f}"
+                )
+                log_to_txt(self.log_file, f"actioness mean: {actioness.mean():.4f}")
+                
+                if self.use_adaptive_lambda:
+                    actioness_thresholds = get_adaptive_actioness_thresholds(
+                        actioness,
+                        central_percentile=self.lambda_percentile,
+                        delta=self.lambda_delta,
+                        step=self.lambda_step,
+                    )
+                    log_to_txt(self.log_file, f"adaptive thresholds: {actioness_thresholds.tolist()}")
+                else:
+                    actioness_thresholds = self.actioness_thresholds
+                    log_to_txt(self.log_file, f"fixed thresholds: {actioness_thresholds.tolist()}")
 
                 proposals = []
 
-                for at in self.actioness_thresholds:
+                for at in actioness_thresholds:
                     for gt in self.grouping_thresholds:
                         unmerged = get_index_proposals_from_1d_score(actioness, at)
                         proposals += merge_proposals(unmerged, actioness, gt, bins)
 
+                log_to_txt(self.log_file, f"proposals raw: {len(proposals)}")
+
                 proposals = np.array(proposals)
-                proposals = proposals[proposals[:, 1] - proposals[:, 0] > 2 * 1e6] #asúmese que os eventos duran polo menos 2s, que só é válido no caso dos pingüíns
-                proposals = temporal_nms(proposals, self.nms_threshold)
+
+                if len(proposals) > 0:
+                    proposals = proposals[proposals[:, 1] - proposals[:, 0] > 2 * 1e6]
+                    proposals = temporal_nms(proposals, self.nms_threshold)
+
+                    log_to_txt(self.log_file, f"proposals after NMS: {len(proposals)}")
+
+                    if len(proposals) > 0:
+                        durations = proposals[:, 1] - proposals[:, 0]
+                        log_to_txt(self.log_file, f"mean duration: {durations.mean():.2f}")
+                        log_to_txt(self.log_file, f"min duration: {durations.min():.2f}")
+                        log_to_txt(self.log_file, f"max duration: {durations.max():.2f}")
+                    else:
+                        log_to_txt(self.log_file, "proposals after NMS: 0")
+                else:
+                    proposals = np.empty((0, 3))
+                    log_to_txt(self.log_file, "proposals after NMS: 0")
+
                 rec_proposal_data[roi_id] = proposals
-                
-                #isto ten unha serie de problemas asociados, que poden verse nos apuntes, pero o caso é que usan a forza bruta e dependen totalmente do actionness
 
         return rec_proposal_data
-
+    
+    
     def run(self):
         """
         Processes all recordings in the data directory to generate action proposals.
 
         Returns:
-            dict: Nested dictionary with recording names as keys and dictionaries
-            (from process_recording) as values.
+            pd.DataFrame: DataFrame with all generated proposals.
         """
         logging.info("Running Proposal Generator.")
 
         with h5py.File(self.data_path, "r") as f:
             recordings = [rec for rec in f.keys() if f[rec].attrs["split"] == "test"]
 
+        log_to_txt(self.log_file, f"\n[INFO] recordings found: {recordings}")
+
         proposal_data = {}
 
         with Pool(processes=16) as pool:
-            results = pool.map(self.process_recording, recordings)
+          results = pool.map(self.process_recording, recordings)
 
         for rec, rec_proposals in zip(recordings, results):
             rec_name = os.path.splitext(rec)[0]
