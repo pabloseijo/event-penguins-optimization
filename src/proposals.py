@@ -1,218 +1,163 @@
+"""Proposal generation pipeline for event-camera action detection (reTAG).
+
+Builds an actionness signal from binned event rates and extracts temporal
+candidate intervals. Includes adaptive thresholding, spatial compactness
+modulation, and noise penalisation (sustained and dispersed).
+"""
+
 import os
 from multiprocessing import Pool
-import pickle
+from typing import Optional
 
 import numpy as np
-from absl import logging
 import pandas as pd
 import h5py
+from absl import logging
 
 from src.utils import temporal_nms
+from src.prototype import get_prototype_score
 
-def log_to_txt(file_path, text):
-    with open(file_path, "a") as f:
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _log(path: str, text: str) -> None:
+    with open(path, "a") as f:
         f.write(text + "\n")
 
-def get_event_rate(events, bin_width):
-    '''
-    events: é un array de dimensión (n_events, 4) onde cada fila é un evento e as columnas son [x, y, t, p], sendo x e y as coordenadas do evento e t o tempo do evento en microsegundos.
-    bin_width: ancho do bin para calcular a taxa de eventos, en microsegundos. Por exemplo, se queremos calcular a taxa de eventos cada 10 ms, o ancho do bin sería 10 * 1e3 = 1e4 microsegundos.
-    '''
- 
-    # o menos un en python é pra coller o último elemento, neste caso a última linha da matriz. Cóllese entón fila 0, columna 2 (t) da primeira fila e fila -1, columna 2 (t) da última fila.
-    # Implícase que os eventos están ordeados por tempo, polo que asumimos que o dataset funciona así, pero en calquera caso pode ser unha fonte de erro de cara a xeralización.
-    t_min, t_max = events[0, 2], events[-1, 2] 
-    
-    # calcúlase o numero de bins necesarios para cubrir o rango de tempo dos eventos. O resultado é un número enteiro que indica cantos bins (defínese nos apuntes de obsidian) se necesitan para cubrir todo o rango de tempo.
+
+def _detect_runs(
+    mask: np.ndarray,
+    bin_width_us: float,
+    min_duration_s: float,
+) -> np.ndarray:
+    """Mark runs of True in *mask* that span at least *min_duration_s* seconds.
+
+    Args:
+        mask: Boolean array of shape (T,).
+        bin_width_us: Bin width in microseconds.
+        min_duration_s: Minimum run length in seconds.
+
+    Returns:
+        Float64 binary array in {0, 1} of shape (T,).
+    """
+    min_bins = max(1, int((min_duration_s * 1e6) / bin_width_us))
+    result = np.zeros(len(mask), dtype=np.float64)
+    diff   = np.diff(mask.astype(int), prepend=0, append=0)
+    starts = np.where(diff ==  1)[0]
+    ends   = np.where(diff == -1)[0]
+    for s, e in zip(starts, ends):
+        if (e - s) >= min_bins:
+            result[s:e] = 1.0
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public functions
+# ---------------------------------------------------------------------------
+
+def get_event_rate(events: np.ndarray, bin_width: float) -> tuple:
+    """Bin events into fixed-width temporal intervals and count events per bin.
+
+    Args:
+        events: Array of shape (N, 4) with columns [x, y, t, p].
+            Events must be time-sorted; t is in microseconds.
+        bin_width: Bin width in microseconds.
+
+    Returns:
+        counts: Array of shape (bin_num,) with event counts per bin.
+        bins: Bin edges in microseconds, shape (bin_num + 1,).
+    """
+    t_min, t_max = events[0, 2], events[-1, 2]
     bin_num = int((t_max - t_min) / bin_width)
-    
-    # calculamos entón cantos eventos (elementos de counts) hai por cada intervalo temporal (elementos de bins). Por exemplo 
-    # [0.00–0.03) → 10 eventos
-    # [0.03–0.06) → 30 eventos
-    # (0.06–0.09) → 5 eventos
-    # Isto é a imaxe mental que obtemos de facer o event rate, que calculamos pasandolle de parámetros a columna de tempo dos eventos como un array, e o número de bins, para que calcule internamente as divisiós do tempo 
     counts, bins = np.histogram(events[:, 2], bins=bin_num)
     return counts, bins
 
 
-def apply_robust_min_max(rate, percentile):
-    #Isto é o que se fai antes de pasarlle o event rate ao actioness para facelo lixeiramente máis robusto. Veremos o que se fai. 
-    
-    # Entón pasaselle rate, que como viumos na función anterior é o número de eventos por bin temporal. Pero pode ter unha serie de problemas, de ruido mesmamente. Vemos o que fan pra solucionalo.
-    
-    # Este paso aplica un recorte robusto á taxa de eventos (rate) antes de calcular
-    # o actionness. O obxectivo é reducir o impacto de valores extremos (outliers),
-    # que poden aparecer debido a ruído puntual ou artefactos do sensor.
-    #
-    # O método consiste en calcular percentís inferior e superior da distribución
-    # de rate e saturar os valores fóra dese rango.
-    #
-    # Limitacións:
-    # - Os percentís son fixos a nivel global, polo que non se adaptan ás características
-    #   específicas de cada secuencia.
-    # - Non distingue entre ruído sostido e actividade relevante, xa que ambos poden
-    #   producir valores elevados de forma consistente.
-    # - A saturación pode reducir a variabilidade interna do sinal en rexións de alta
-    #   actividade, diminuíndo a capacidade discriminativa posterior.
-    #
-    # Isto motiva a necesidade de mellorar a modelización do sinal de entrada,
-    # incorporando criterios adicionais (por exemplo, información espacial ou
-    # estrutura temporal) en lugar de depender unicamente da magnitude da actividade.
-    
+def apply_robust_min_max(rate: np.ndarray, percentile: float) -> np.ndarray:
+    """Clip per-bin event rates to suppress outliers.
+
+    Saturates values outside the symmetric percentile band
+    [0.5*percentile, 100 - 0.5*percentile]. Modifies the array in-place.
+
+    Args:
+        rate: Per-bin event counts, shape (bin_num,).
+        percentile: Clipping strength; higher values clip more.
+
+    Returns:
+        The same array, clipped in-place.
+    """
     rmin = np.percentile(rate.flat, 0.5 * percentile)
     rmax = np.percentile(rate.flat, 100 - 0.5 * percentile)
-    
     rate[rate < rmin] = rmin
     rate[rate > rmax] = rmax
-    
     return rate
 
 
 def get_index_proposals_from_1d_score(
-    score1d: np.ndarray, threshold: float
+    score1d: np.ndarray,
+    threshold: float,
 ) -> np.ndarray:
-    """
-    Xera propostas temporais a partir dun sinal 1D mediante segmentación por limiar.
+    """Extract contiguous above-threshold segments from a 1D score signal.
 
-    ENTRADA:
-    - score1d: array 1D que representa un sinal ao longo do tempo.
-      No contexto deste proxecto, corresponde ao actionness, é dicir,
-      unha medida da actividade baseada na taxa de eventos.
-    - threshold: limiar escalar (o lambda para seren máis exactos). Define a partir de que valor do sinal
-      se considera que hai actividade relevante.
+    Args:
+        score1d: Actionness signal of shape (T,).
+        threshold: Activation threshold λ.
 
-    PROCESO:
-    - Constrúese unha máscara booleana (score1d > threshold), que indica
-      en que instantes o sinal supera o limiar. É dicir, un array de 0 e 1 onde 
-      1 indica que o sinal supera o limiar e 0 indica que non.
-    - Calcúlase a diferenza discreta (np.diff) sobre esa máscara, o que
-      permite detectar transicións:
-          0 → 1 : inicio dun segmento activo
-          1 → 0 : fin dun segmento activo
-    - Engádense valores ao principio e ao final (prepend, append) para
-      garantir que se detectan correctamente os segmentos nos bordes.
-    - Extráense os índices destas transicións e reagrúpanse en pares
-      (inicio, fin), representando intervalos continuos de actividade.
-
-    SAÍDA:
-    - Array de tamaño (n, 2), onde cada fila define unha proposta temporal
-      en índices do sinal: [start_index, end_index].
-
-    LIMITACIÓNS (IMPORTANTE PARA O TFG):
-    - A xeración de propostas depende exclusivamente dun limiar fixo, polo
-      que é altamente sensible á súa elección.
-    - Non existe adaptación ao contexto da secuencia (nivel base de actividade).
-    - Non distingue entre actividade relevante e ruído: ambos poden superar
-      o limiar se teñen magnitude suficiente.
-    - Ignora completamente a estrutura interna do sinal (forma, patrón temporal)
-      e toda a información espacial dos eventos.
-    - Pode producir fragmentación excesiva (múltiples segmentos curtos) que
-      posteriormente deben ser corrixidos mediante merging.
-
-    IMPLICACIÓN:
-    Este método implementa unha segmentación baseada en magnitude, o que
-    motiva a necesidade de mellorar a definición de actionness ou introducir
-    limiares adaptativos no contexto do TFG.
+    Returns:
+        Array of shape (n, 2) with [start_idx, end_idx] for each segment
+        where score1d > threshold.
     """
     return np.where(np.diff(score1d > threshold, prepend=0, append=0))[0].reshape(-1, 2)
 
 
-def check_merge_possible(proposal_1, proposal_2, basin_durations, threshold):
+def check_merge_possible(
+    proposal_1: np.ndarray,
+    proposal_2: np.ndarray,
+    accumulated_duration: float,
+    threshold: float,
+) -> bool:
+    """Decide whether merging proposal_2 into proposal_1 is warranted.
+
+    Merges if the ratio of active bins to total span would exceed *threshold*
+    after incorporating proposal_2.
+
+    Args:
+        proposal_1: Current proposal [start, end] in bin indices.
+        proposal_2: Next proposal [start, end] in bin indices.
+        accumulated_duration: Active-bin count accumulated so far.
+        threshold: Minimum activity ratio to trigger a merge.
+
+    Returns:
+        True if the proposals should be merged.
     """
-    Determina se dúas propostas temporais deben fusionarse nun único intervalo.
+    candidate_active = accumulated_duration + (proposal_2[1] - proposal_2[0])
+    candidate_span   = proposal_2[1] - proposal_1[0]
+    return candidate_active / candidate_span > threshold
 
-    ENTRADA:
-    - proposal_1: proposta actual [start_index, end_index]
-    - proposal_2: seguinte proposta [start_index, end_index]
-    - basin_durations: duración acumulada de rexións activas (sinal por riba do limiar)
-      dentro do segmento que se está a construír.
-    - threshold: limiar de agrupamento (entre 0 e 1)
 
-    PROCESO:
-    - Engádese a duración de proposal_2 á duración acumulada de actividade.
-    - Calcúlase a duración total do intervalo combinado, desde o inicio de
-      proposal_1 ata o final de proposal_2.
-    - Avalíase a proporción de tempo activo dentro do intervalo total:
+def merge_proposals(
+    unmerged: np.ndarray,
+    score: np.ndarray,
+    grouping_thres: float,
+    times: np.ndarray,
+) -> list:
+    """Merge an initial proposal list into longer, coherent intervals.
 
-          activity_ratio = basin_durations / merged_duration
+    Iterates proposals in temporal order and merges consecutive ones when
+    their activity ratio (active bins / total span) exceeds *grouping_thres*.
+    The merged proposal score is the mean of *score* over its span.
 
-    - Se esta proporción supera o limiar, considérase que as propostas forman
-      parte dun mesmo evento continuo e deben fusionarse.
+    Args:
+        unmerged: Proposals as bin-index pairs, shape (n, 2).
+        score: Actionness signal, shape (T,).
+        grouping_thres: Activity-ratio threshold for merging.
+        times: Bin-edge timestamps in microseconds, shape (bin_num + 1,).
 
-    SAÍDA:
-    - True  → fusionar propostas
-    - False → manter propostas separadas
-
-    LIMITACIÓNS:
-    - O criterio baséase exclusivamente na ocupación temporal, sen ter en conta
-      a intensidade real do sinal (score) nin a súa estrutura interna.
-    - Non distingue entre actividade relevante e ruído, xa que ambos poden
-      producir rexións densas en termos de tempo.
-    - Non incorpora información espacial nin patróns de movemento.
-    - A decisión depende dun limiar fixo, que pode non ser óptimo para todas
-      as secuencias.
-
-    IMPLICACIÓN:
-    Este mecanismo tenta corrixir a fragmentación xerada pola segmentación por
-    limiar, pero segue sendo un criterio heurístico limitado baseado unicamente
-    en proporción temporal.
+    Returns:
+        List of [t_start, t_end, mean_score] for each merged proposal.
     """
-    
-    basin_durations += proposal_2[1] - proposal_2[0]
-    merged_duration = proposal_2[1] - proposal_1[0]
-
-    if basin_durations / merged_duration > threshold:
-        return True
-    else:
-        return False
-
-
-def merge_proposals(unmerged, score, grouping_thres, times):
-    """
-    Fusiona propostas temporais iniciais en propostas máis longas e consistentes.
-
-    ENTRADA:
-    - unmerged: array de propostas en índices, de tamaño (n, 2), onde cada fila
-      representa un intervalo [start_index, end_index] no sinal temporal.
-    - score: sinal 1D asociado ao tempo (neste proxecto, o actioness), usado para
-      calcular a puntuación media da proposta resultante.
-    - grouping_thres: limiar de agrupamento que controla se dúas propostas
-      consecutivas deben fusionarse.
-    - times: vector cos tempos reais asociados aos índices do sinal, utilizado
-      para converter as propostas de índices a tempo físico.
-
-    PROCESO:
-    - Percórrese a lista de propostas iniciais en orde temporal.
-    - Mantense unha proposta actual ('current') que se intenta ampliar coa
-      seguinte proposta ('next_proposal').
-    - A decisión de fusionar ou non tómase mediante check_merge_possible(...),
-      que avalía a proporción de actividade acumulada no intervalo combinado.
-    - Se se decide fusionar, exténdese o final da proposta actual.
-    - Se non se fusiona, péchase a proposta actual, convértese de índices a tempo
-      real e asígnaselle unha puntuación igual á media do score dentro do intervalo.
-    - O resultado é unha lista de propostas fusionadas con formato:
-          [t_start, t_end, mean_score]
-
-    SAÍDA:
-    - Lista de propostas fusionadas, expresadas en tempo real e con score asociado.
-
-    LIMITACIÓNS:
-    - A fusión baséase nun criterio heurístico puramente temporal.
-    - Non usa información espacial nin estrutura interna do movemento.
-    - O score final da proposta depende directamente do sinal de entrada; se o
-      actioness non é discriminativo, a proposta fusionada tampouco o será.
-    - O comportamento depende dun limiar fixo (grouping_thres), sen adaptación
-      específica á secuencia.
-    - A implementación modifica a proposta actual en sitio (current[1] = ...),
-      o que pode facer o código menos claro e máis fráxil de manter.
-
-    IMPLICACIÓN:
-    Esta función compensa a fragmentación producida pola segmentación por limiar,
-    pero non resolve as limitacións estruturais do modelo. Por iso, no contexto
-    do TFG, resulta máis prometedor mellorar o sinal de actioness de entrada ca
-    modificar esta heurística de agrupamento.
-    """
-    
     merged = []
     current = None
     accumulated_basin_durations = 0
@@ -221,241 +166,624 @@ def merge_proposals(unmerged, score, grouping_thres, times):
         if current is None:
             current = next_proposal
             accumulated_basin_durations += next_proposal[1] - next_proposal[0]
-            
         else:
-            
             do_merge = check_merge_possible(
                 current, next_proposal, accumulated_basin_durations, grouping_thres
             )
-            
             if do_merge:
-                current[1] = next_proposal[1] # é dicir, que o final do intervalo actual se estenda ata o final da seguinte proposta, fusionando así os dous intervalos nun só.
-                accumulated_basin_durations += next_proposal[1] - next_proposal[0] # actualizamos a duración acumulada de actividade, sumando a duración da seguinte proposta, xa que agora forman parte do mesmo intervalo fusionado.
-
-            elif not do_merge or (next_proposal == unmerged[-1]).all(): # se non se fusionan ou se é a última proposta, entón engadimos a proposta actual ao resultado final.
-                t_start = times[current[0]]
-                t_end = times[current[1]]
-
+                current[1] = next_proposal[1]
+                accumulated_basin_durations += next_proposal[1] - next_proposal[0]
+            elif not do_merge or (next_proposal == unmerged[-1]).all():
                 merged.append([
-                        t_start,
-                        t_end,
-                        np.mean(score[current[0] : current[1]]), # media do score dentro do intervalo fusionado, que se usará como puntuación da proposta final.
-                    ])
-
+                    times[current[0]],
+                    times[current[1]],
+                    np.mean(score[current[0]:current[1]]),
+                ])
                 current = next_proposal
                 accumulated_basin_durations = 0
 
     return merged
 
-def get_adaptive_actioness_thresholds(actioness, central_percentile=80, delta=0.10, step=0.05):
-    """
-    Calcula un conxunto pequeno de thresholds adaptados á distribución do actioness.
 
-    Parámetros
-    ----------
-    actioness : np.ndarray
-        Sinal normalizado en [0, 1].
-    central_percentile : float
-        Percentil central usado para estimar lambda.
-    delta : float
-        Marxe arredor do lambda central.
-    step : float
-        Paso entre thresholds.
+def get_adaptive_actioness_thresholds(
+    actioness: np.ndarray,
+    central_percentile: float = 80,
+    delta: float = 0.10,
+    step: float = 0.05,
+) -> np.ndarray:
+    """Compute a threshold grid centred on the actionness distribution.
 
-    Retorna
-    -------
-    np.ndarray
-        Array cos thresholds adaptativos.
+    Instead of a fixed global grid, the grid adapts to each sequence by
+    anchoring its centre at *central_percentile* of the actionness signal.
+
+    Args:
+        actioness: Normalised signal in [0, 1], shape (T,).
+        central_percentile: Percentile used as the grid centre.
+        delta: Half-width of the threshold range around the centre.
+        step: Step between consecutive thresholds.
+
+    Returns:
+        Sorted unique thresholds, clipped to [0.05, 0.95].
     """
-    
-    # Calculamos cal é o valor do actioness correspondente ao percentil. 
     lambda_center = np.percentile(actioness, central_percentile)
-
-    # Como queremos xerar un conxunto pequeno, xeneramos thresholds arredor dese valor central, 
-    # nun rango definido por delta, e cun paso definido por step. Por exemplo, se lambda_center 
-    # é 0.6, delta é 0.10 e step é 0.05, xeneraríamos thresholds en [0.5, 0.55, 0.6, 0.65, 0.7], 
-    # pero se lambda_center é 0.2, xeneraríamos thresholds en [0.1, 0.15, 0.2, 0.25, 0.3].
-    thresholds = np.arange(
-        lambda_center - delta,
-        lambda_center + delta + 1e-9, # 1e-9 para asegurar que se inclúe o límite superior cando se xenera o array con np.arange, por fallos cos flotantes
-        step
-    )
-
-    # Aseguramos que os thresholds están dentro do rango [0.05, 0.95] 
-    # para evitar valores extremos que poidan xerar demasiados ou poucos segmentos.
-    # E por último eliminamos duplicados. 
+    # +1e-9 ensures np.arange reliably includes the upper bound despite float rounding
+    thresholds = np.arange(lambda_center - delta, lambda_center + delta + 1e-9, step)
     thresholds = np.clip(thresholds, 0.05, 0.95)
-    thresholds = np.unique(np.round(thresholds, 4))
+    return np.unique(np.round(thresholds, 4))
 
-    return thresholds
+
+def get_spatial_compactness(
+    events: np.ndarray,
+    bins: np.ndarray,
+    roi_height: int,
+    roi_width: int,
+) -> np.ndarray:
+    """Compute a spatial compactness signal per temporal bin.
+
+    Measures how concentrated events are within the ROI for each bin.
+    High values → events clustered in a small region → likely real action.
+    Low values → events spread across the ROI → likely background or noise.
+
+    Uses the RMS distance from the per-bin centroid, normalised by the ROI
+    semi-diagonal. Fully vectorised via np.bincount.
+
+    Args:
+        events: Array of shape (N, 4) with columns [x, y, t, p].
+            Coordinates are relative to the ROI bounding box.
+        bins: Bin edges in microseconds, shape (bin_num + 1,).
+        roi_height: ROI height in pixels.
+        roi_width: ROI width in pixels.
+
+    Returns:
+        Compactness signal in [0, 1] per bin, shape (bin_num,).
+        Bins with fewer than 2 events receive 0 (insufficient data).
+    """
+    bin_num = len(bins) - 1
+    bin_idx = np.searchsorted(bins[1:], events[:, 2], side='right')
+    bin_idx = np.clip(bin_idx, 0, bin_num - 1)
+
+    x = events[:, 0].astype(np.float64)
+    y = events[:, 1].astype(np.float64)
+
+    count  = np.bincount(bin_idx, minlength=bin_num).astype(np.float64)
+    sum_x  = np.bincount(bin_idx, weights=x,     minlength=bin_num)
+    sum_y  = np.bincount(bin_idx, weights=y,     minlength=bin_num)
+    sum_x2 = np.bincount(bin_idx, weights=x * x, minlength=bin_num)
+    sum_y2 = np.bincount(bin_idx, weights=y * y, minlength=bin_num)
+
+    safe_count = np.maximum(count, 1.0)
+    mean_x = sum_x / safe_count
+    mean_y = sum_y / safe_count
+
+    # Clamp negatives: floating-point cancellation can produce tiny negative variances
+    var_x = np.maximum(sum_x2 / safe_count - mean_x ** 2, 0.0)
+    var_y = np.maximum(sum_y2 / safe_count - mean_y ** 2, 0.0)
+
+    spread     = np.sqrt(var_x + var_y)
+    max_spread = np.sqrt((roi_width / 2.0) ** 2 + (roi_height / 2.0) ** 2) + 1e-9
+
+    # Bins with fewer than 2 events have no reliable centroid estimate
+    return np.where(count >= 2, 1.0 - np.clip(spread / max_spread, 0.0, 1.0), 0.0)
+
+
+def get_sustained_noise_indicator(
+    rate: np.ndarray,
+    bin_width_us: float,
+    min_duration_s: float = 20.0,
+    high_percentile: float = 98,
+    variance_window: int = 10,
+) -> np.ndarray:
+    """Identify bins with high, sustained, and temporally flat activity.
+
+    Targets persistent background noise: sensor drift, wind, camera vibration.
+    These produce high event rates that remain approximately constant over time,
+    unlike real actions which have internal temporal structure.
+
+    Three criteria must hold simultaneously:
+    1. Rate ≥ *high_percentile* of the global distribution.
+    2. Low local temporal variance (flat signal, not a transient peak).
+    3. Sustained for at least *min_duration_s* seconds.
+
+    Args:
+        rate: Per-bin event counts after robust scaling, shape (bin_num,).
+        bin_width_us: Bin width in microseconds.
+        min_duration_s: Minimum segment length in seconds.
+        high_percentile: Percentile defining "high activity".
+        variance_window: Rolling-variance window size in bins.
+
+    Returns:
+        Binary indicator in {0, 1}, shape (bin_num,).
+    """
+    # >= rather than > so that plateau values exactly at the percentile are included
+    above = rate >= np.percentile(rate, high_percentile)
+
+    # Rolling variance via Var = E[X²] − E[X]² (vectorised, no Python loops)
+    kernel = np.ones(variance_window) / variance_window
+    rolling_mean    = np.convolve(rate,      kernel, mode='same')
+    rolling_sq_mean = np.convolve(rate ** 2, kernel, mode='same')
+    # mode='same' uses partial windows at boundaries; clamp numerical negatives
+    rolling_var = np.maximum(rolling_sq_mean - rolling_mean ** 2, 0.0)
+    flat = rolling_var <= np.percentile(rolling_var, 33)
+
+    return _detect_runs(above & flat, bin_width_us, min_duration_s)
+
+
+def get_dispersed_noise_indicator(
+    rate: np.ndarray,
+    compactness: np.ndarray,
+    bin_width_us: float,
+    min_duration_s: float = 20.0,
+    high_percentile: float = 90,
+    dispersion_percentile: float = 20,
+) -> np.ndarray:
+    """Identify bins with high rate and high spatial dispersion sustained over time.
+
+    Targets precipitation (snow, rain): events distributed randomly across the
+    ROI. Complements get_sustained_noise_indicator — snow has HIGH temporal
+    variance (random events), so the flat-variance criterion of the sustained
+    indicator misses it; but its spatial compactness is near zero, which this
+    indicator detects.
+
+    Three criteria must hold simultaneously:
+    1. Rate ≥ *high_percentile* of the global distribution.
+    2. Compactness ≤ *dispersion_percentile* (highly dispersed bins).
+    3. Sustained for at least *min_duration_s* seconds.
+
+    Both percentile thresholds are relative to the ROI to adapt to varying
+    conditions across sequences.
+
+    Args:
+        rate: Per-bin event counts after robust scaling, shape (bin_num,).
+        compactness: Spatial compactness per bin (from get_spatial_compactness),
+            shape (bin_num,).
+        bin_width_us: Bin width in microseconds.
+        min_duration_s: Minimum segment length in seconds.
+        high_percentile: Percentile defining "high activity". Lower than the
+            sustained indicator (90 vs 98) because precipitation does not
+            always produce the most extreme rate spikes.
+        dispersion_percentile: Compactness percentile below which a bin is
+            considered highly dispersed.
+
+    Returns:
+        Binary indicator in {0, 1}, shape (bin_num,).
+    """
+    above     = rate >= np.percentile(rate, high_percentile)
+    dispersed = compactness <= np.percentile(compactness, dispersion_percentile)
+    return _detect_runs(above & dispersed, bin_width_us, min_duration_s)
+
+
+def get_periodicity_indicator(
+    rate: np.ndarray,
+    bin_width_us: float,
+    min_period_s: float = 0.3,
+    max_period_s: float = 2.0,
+    window_s: float = 3.0,
+    global_threshold: float = 0.30,
+    local_threshold: float = 0.30,
+    min_duration_s: float = 3.0,
+) -> np.ndarray:
+    """Identify bins with locally periodic activity in the wing-flap frequency range.
+
+    Wing flaps are rhythmic (0.5–3 Hz); Ecstatic Displays produce a single
+    sustained peak with no periodicity. This indicator detects segments where
+    the rate signal oscillates at a consistent lag within [min_period_s,
+    max_period_s] and penalises them in the actionness.
+
+    Two-stage detection:
+    1. **Global screening** — FFT-based autocorrelation over the full ROI to
+       check whether any dominant period exists in the target range. Returns
+       zeros immediately if the global peak is below *global_threshold*.
+    2. **Local confirmation** — sliding-window normalised cross-correlation at
+       the dominant lag. Bins where the local cross-correlation exceeds
+       *local_threshold* are marked as periodic. *_detect_runs* then requires
+       the periodic pattern to be sustained for at least *min_duration_s*.
+
+    Both steps are fully vectorised (FFT + convolution); no Python loops.
+
+    Args:
+        rate: Per-bin event counts after robust scaling, shape (bin_num,).
+        bin_width_us: Bin width in microseconds.
+        min_period_s: Minimum oscillation period in seconds (≈ max frequency).
+        max_period_s: Maximum oscillation period in seconds (≈ min frequency).
+        window_s: Sliding window length in seconds for local cross-correlation.
+        global_threshold: Minimum normalised autocorrelation peak to proceed.
+        local_threshold: Minimum local cross-correlation to mark a bin periodic.
+        min_duration_s: Minimum sustained periodic segment length in seconds.
+
+    Returns:
+        Binary indicator in {0, 1}, shape (bin_num,).
+    """
+    n = len(rate)
+    bin_width_s = bin_width_us / 1e6
+
+    min_lag = max(1, int(min_period_s / bin_width_s))
+    max_lag = min(n // 2, int(max_period_s / bin_width_s))
+    if min_lag >= max_lag:
+        return np.zeros(n, dtype=np.float64)
+
+    # --- Stage 1: global autocorrelation via FFT ---
+    centered = rate - rate.mean()
+    fft_val  = np.fft.rfft(centered, n=2 * n)
+    autocorr = np.fft.irfft(fft_val * np.conj(fft_val))[:n]
+    norm     = autocorr[0]
+    if norm < 1e-9:
+        return np.zeros(n, dtype=np.float64)
+    autocorr /= norm
+
+    dominant_lag = int(np.argmax(autocorr[min_lag:max_lag + 1])) + min_lag
+    if autocorr[dominant_lag] < global_threshold:
+        return np.zeros(n, dtype=np.float64)
+
+    # --- Stage 2: sliding local cross-correlation at dominant_lag ---
+    T   = dominant_lag
+    W   = max(2, int(window_s / bin_width_s))
+    pad = np.zeros(T, dtype=np.float64)
+
+    # Pairs: X = rate[:-T], Y = rate[T:], both length (n - T)
+    X = rate[:-T]
+    Y = rate[T:]
+    m = len(X)
+
+    kernel = np.ones(W) / W
+
+    mean_X  = np.convolve(X,      kernel, mode='same')
+    mean_Y  = np.convolve(Y,      kernel, mode='same')
+    mean_XY = np.convolve(X * Y,  kernel, mode='same')
+    mean_X2 = np.convolve(X ** 2, kernel, mode='same')
+    mean_Y2 = np.convolve(Y ** 2, kernel, mode='same')
+
+    std_X = np.sqrt(np.maximum(mean_X2 - mean_X ** 2, 0.0))
+    std_Y = np.sqrt(np.maximum(mean_Y2 - mean_Y ** 2, 0.0))
+
+    local_corr = (mean_XY - mean_X * mean_Y) / (std_X * std_Y + 1e-9)
+    local_corr = np.clip(local_corr, 0.0, 1.0)
+
+    # Pad back to full length (last T bins have no paired signal → 0)
+    local_corr_full = np.concatenate([local_corr, pad])[:n]
+
+    periodic_mask = local_corr_full >= local_threshold
+    return _detect_runs(periodic_mask, bin_width_us, min_duration_s)
+
+
+# ---------------------------------------------------------------------------
+# Proposal generator
+# ---------------------------------------------------------------------------
 
 class ProposalGenerator:
+    """Generate temporal action proposals from event-camera ROI data.
+
+    Computes a per-bin actionness signal from the event rate, optionally
+    modulated by spatial compactness and penalised for noise, then segments
+    it into candidate action intervals via thresholding and temporal NMS.
+
+    The actionness formula with all improvements active is:
+
+        combined(t) = r(t) · (1 + w₂·compactness(t))
+                            · (1 + w₅·prototype_score(t))
+                            · (1 − w₃·noise(t))
+                            · (1 − w₄·disp_noise(t))
+                            · (1 − w₆·periodicity(t))
+        a(t) = normalise(combined(t))
+
+    Args:
+        data_path: Path to the preprocessed HDF5 file.
+        bin_width: Temporal bin width in seconds.
+        percentile: Clipping percentile for robust rate scaling.
+        nms_threshold: IoU threshold for temporal NMS.
+        output_dir: Directory for the run log file.
+        use_adaptive_lambda: Use per-sequence percentile-based thresholds
+            instead of a fixed grid.
+        lambda_percentile: Percentile of the actionness used as the grid centre.
+        lambda_delta: Half-width of the threshold grid around the centre.
+        lambda_step: Step between consecutive thresholds.
+        use_spatial_compactness: Amplify actionness in spatially compact bins
+            (w₂ modulation).
+        spatial_weight: Compactness amplification weight w₂.
+        use_noise_penalization: Dampen sustained flat-noise bins (wind,
+            vibration) with weight w₃.
+        noise_percentile: Rate percentile defining "high activity" for
+            sustained noise detection.
+        noise_min_duration: Minimum sustained-noise segment length (s).
+        noise_weight: Sustained-noise damping weight w₃.
+        noise_variance_window: Rolling-variance window in bins.
+        use_dispersed_noise: Dampen dispersed-noise bins (snow, rain) with
+            weight w₄.
+        dispersed_noise_percentile: Rate percentile for dispersed-noise
+            detection.
+        dispersed_noise_dispersion_percentile: Compactness percentile below
+            which a bin is considered spatially dispersed.
+        dispersed_noise_min_duration: Minimum dispersed-noise segment length (s).
+        dispersed_noise_weight: Dispersed-noise damping weight w₄.
+        prototype: Pre-built ED spatial prototype array of shape (grid_h, grid_w),
+            as returned by src.prototype.build_ed_prototype. When provided,
+            bins whose spatial event distribution resembles an ED are amplified
+            by w₅ (prototype_weight). This only amplifies — never suppresses —
+            so AR cannot decrease.
+        prototype_weight: Prototype amplification weight w₅.
     """
-    Generates action proposals based on temporal actioness scores across
-    multiple regions of interest (ROI) within recordings.
 
-    Attributes:
-        data_dir (str): Directory containing the preprocessed data.
-        bin_width (float): Width of the bins used for event rate calculation [us].
-        percentile (float): Percentile used for robust scaling of event rates.
-        nms_threshold (float): Threshold for non-maximal suppression.
-    """
+    def __init__(
+        self,
+        data_path: str,
+        bin_width: float,
+        percentile: float,
+        nms_threshold: float,
+        output_dir: str = "output",
+        use_adaptive_lambda: bool = False,
+        lambda_percentile: float = 75,
+        lambda_delta: float = 0.20,
+        lambda_step: float = 0.05,
+        use_spatial_compactness: bool = False,
+        spatial_weight: float = 0.2,
+        use_noise_penalization: bool = False,
+        noise_percentile: float = 98,
+        noise_min_duration: float = 20.0,
+        noise_weight: float = 0.5,
+        noise_variance_window: int = 10,
+        use_dispersed_noise: bool = False,
+        dispersed_noise_percentile: float = 90,
+        dispersed_noise_dispersion_percentile: float = 20,
+        dispersed_noise_min_duration: float = 20.0,
+        dispersed_noise_weight: float = 0.5,
+        prototype: Optional[np.ndarray] = None,
+        prototype_weight: float = 0.3,
+        use_periodicity: bool = False,
+        periodicity_min_period_s: float = 0.3,
+        periodicity_max_period_s: float = 2.0,
+        periodicity_window_s: float = 3.0,
+        periodicity_global_threshold: float = 0.65,
+        periodicity_local_threshold: float = 0.60,
+        periodicity_min_duration_s: float = 3.0,
+        periodicity_weight: float = 0.5,
+    ) -> None:
+        tags = []
+        if use_adaptive_lambda:     tags.append("adaptive")
+        if use_spatial_compactness: tags.append("spatial")
+        if use_noise_penalization:  tags.append("noise")
+        if use_dispersed_noise:     tags.append("dispersed")
+        if prototype is not None:   tags.append("proto")
+        if use_periodicity:         tags.append("period")
+        self._run_tag = "_".join(tags) if tags else "baseline"
 
-    def __init__(self, data_path, bin_width, percentile, nms_threshold, use_adaptive_lambda=False) -> None:
-        if use_adaptive_lambda:
-            self.log_file = os.path.join("output", "retag_adaptive_full.txt")
-        else:
-            self.log_file = os.path.join("output", "retag_baseline_full.txt")
-
+        os.makedirs(output_dir, exist_ok=True)
+        self.log_file = os.path.join(output_dir, f"retag_{self._run_tag}_full.txt")
         with open(self.log_file, "w") as f:
-            if use_adaptive_lambda:
-                f.write("=== RUN RETAG ADAPTIVE ===\n")
-            else:
-                f.write("=== RUN RETAG BASELINE ===\n")
-            
-        self.data_path = data_path
-        self.bin_width = bin_width * 1e6  # us
-        
-        self.use_adaptive_lambda = use_adaptive_lambda
-        
-        self.percentile = percentile
+            f.write(f"=== RUN RETAG {self._run_tag.upper()} ===\n")
+
+        self.data_path   = data_path
+        self.bin_width   = bin_width * 1e6  # convert s → µs
+        self.percentile  = percentile
         self.nms_threshold = nms_threshold
-        
+
+        self.use_adaptive_lambda = use_adaptive_lambda
+        self.lambda_percentile   = lambda_percentile
+        self.lambda_delta        = lambda_delta
+        self.lambda_step         = lambda_step
+
+        self.use_spatial_compactness = use_spatial_compactness
+        self.spatial_weight          = spatial_weight
+
+        self.use_noise_penalization = use_noise_penalization
+        self.noise_percentile       = noise_percentile
+        self.noise_min_duration     = noise_min_duration
+        self.noise_weight           = noise_weight
+        self.noise_variance_window  = noise_variance_window
+
+        self.use_dispersed_noise                   = use_dispersed_noise
+        self.dispersed_noise_percentile            = dispersed_noise_percentile
+        self.dispersed_noise_dispersion_percentile = dispersed_noise_dispersion_percentile
+        self.dispersed_noise_min_duration          = dispersed_noise_min_duration
+        self.dispersed_noise_weight                = dispersed_noise_weight
+
+        self.prototype        = prototype
+        self.prototype_weight = prototype_weight
+
+        self.use_periodicity                = use_periodicity
+        self.periodicity_min_period_s       = periodicity_min_period_s
+        self.periodicity_max_period_s       = periodicity_max_period_s
+        self.periodicity_window_s           = periodicity_window_s
+        self.periodicity_global_threshold   = periodicity_global_threshold
+        self.periodicity_local_threshold    = periodicity_local_threshold
+        self.periodicity_min_duration_s     = periodicity_min_duration_s
+        self.periodicity_weight             = periodicity_weight
+
         self.actioness_thresholds = np.arange(0.05, 1, 0.05)
-        
-        self.lambda_percentile = 80
-        self.lambda_delta = 0.10
-        self.lambda_step = 0.05
+        self.grouping_thresholds  = np.arange(0.05, 1, 0.05)
 
-        self.grouping_thresholds = np.arange(0.05, 1, 0.05)
-
-    def process_recording(self, rec):
-        """
-        Processes a single recording to generate action proposals for each ROI.
+    def process_recording(self, rec: str) -> dict:
+        """Process all ROIs in one recording and return their proposals.
 
         Args:
-            rec (str): The name of the recording to process.
+            rec: Recording key in the HDF5 file.
 
         Returns:
-            dict: Dictionary with ROI ids as keys and proposal arrays as values.
+            Dict mapping roi_id → proposal array of shape (n, 3) with columns
+            [t_start_µs, t_end_µs, score].
         """
         rec_proposal_data = {}
+        _log(self.log_file, f"\n[RECORDING] {rec}")
 
-        log_to_txt(self.log_file, f"\n[RECORDING] {rec}")
+        with h5py.File(self.data_path, "r") as hf:
+            data = hf[rec]
+            for roi_id in data.keys():
+                events     = np.array(data[roi_id]["events"])
+                roi_height = int(data[roi_id].attrs["height"])
+                roi_width  = int(data[roi_id].attrs["width"])
 
-        with h5py.File(self.data_path, "r") as file:
-            data = file[rec]
-            roi_ids = data.keys()
-
-            for roi_id in roi_ids:
-                events = np.array(data[roi_id]["events"])
-
-                log_to_txt(self.log_file, f"\n[ROI] {roi_id}")
-                log_to_txt(self.log_file, f"n_events: {len(events)}")
+                _log(self.log_file, f"\n[ROI] {roi_id}")
+                _log(self.log_file, f"n_events: {len(events)}")
 
                 rate, bins = get_event_rate(events, self.bin_width)
                 rate = apply_robust_min_max(rate, self.percentile)
 
-                log_to_txt(self.log_file, f"rate min/max: {rate.min()} / {rate.max()}")
-                log_to_txt(self.log_file, f"rate mean: {rate.mean():.4f}")
+                _log(self.log_file, f"rate min/max: {rate.min()} / {rate.max()}")
+                _log(self.log_file, f"rate mean: {rate.mean():.4f}")
 
-                min_rate, max_rate = np.min(rate), np.max(rate)
-
-                # Protección contra división por cero
-                if max_rate == min_rate:
-                    actioness = np.zeros_like(rate, dtype=np.float64)
-                else:
-                    actioness = (rate - min_rate) / (max_rate - min_rate)
-
-                log_to_txt(
-                    self.log_file,
-                    f"actioness min/max: {actioness.min():.4f} / {actioness.max():.4f}"
+                r_min, r_max = rate.min(), rate.max()
+                r_t = (
+                    (rate - r_min) / (r_max - r_min)
+                    if r_max > r_min
+                    else np.zeros_like(rate, dtype=np.float64)
                 )
-                log_to_txt(self.log_file, f"actioness mean: {actioness.mean():.4f}")
-                
+
+                # Compute compactness once; reused by spatial and dispersed-noise steps
+                needs_compactness = self.use_spatial_compactness or self.use_dispersed_noise
+                if needs_compactness:
+                    compactness = get_spatial_compactness(events, bins, roi_height, roi_width)
+                    c_min, c_max = compactness.min(), compactness.max()
+                    compactness_norm = (
+                        (compactness - c_min) / (c_max - c_min)
+                        if c_max > c_min
+                        else np.zeros_like(compactness)
+                    )
+
+                # Build combined signal — multiplicative so noise steps only suppress
+                # already-active bins and cannot create spurious peaks
+                if self.use_spatial_compactness:
+                    combined = r_t * (1.0 + self.spatial_weight * compactness_norm)
+                    _log(self.log_file, f"compactness mean: {compactness_norm.mean():.4f}")
+                    _log(self.log_file, f"spatial_weight: {self.spatial_weight}")
+                else:
+                    combined = r_t
+
+                # Prototype amplification: bins that resemble the ED spatial
+                # template get amplified. Pure amplification → AR cannot drop.
+                if self.prototype is not None:
+                    proto_score = get_prototype_score(
+                        events, bins, self.prototype, roi_height, roi_width
+                    )
+                    combined = combined * (1.0 + self.prototype_weight * proto_score)
+                    _log(self.log_file, f"proto_score mean: {proto_score.mean():.4f}")
+                    _log(self.log_file, f"proto_score max:  {proto_score.max():.4f}")
+                    _log(self.log_file, f"prototype_weight: {self.prototype_weight}")
+
+                if self.use_periodicity:
+                    periodicity = get_periodicity_indicator(
+                        rate,
+                        bin_width_us=self.bin_width,
+                        min_period_s=self.periodicity_min_period_s,
+                        max_period_s=self.periodicity_max_period_s,
+                        window_s=self.periodicity_window_s,
+                        global_threshold=self.periodicity_global_threshold,
+                        local_threshold=self.periodicity_local_threshold,
+                        min_duration_s=self.periodicity_min_duration_s,
+                    )
+                    combined = combined * (1.0 - self.periodicity_weight * periodicity)
+                    _log(self.log_file, f"periodic bins: {int(periodicity.sum())} / {len(periodicity)}")
+                    _log(self.log_file, f"periodicity_weight: {self.periodicity_weight}")
+
+                if self.use_noise_penalization:
+                    noise = get_sustained_noise_indicator(
+                        rate,
+                        bin_width_us=self.bin_width,
+                        min_duration_s=self.noise_min_duration,
+                        high_percentile=self.noise_percentile,
+                        variance_window=self.noise_variance_window,
+                    )
+                    combined = combined * (1.0 - self.noise_weight * noise)
+                    _log(self.log_file, f"noise bins: {int(noise.sum())} / {len(noise)}")
+                    _log(self.log_file, f"noise_weight: {self.noise_weight}")
+
+                if self.use_dispersed_noise:
+                    disp_noise = get_dispersed_noise_indicator(
+                        rate,
+                        compactness,
+                        bin_width_us=self.bin_width,
+                        min_duration_s=self.dispersed_noise_min_duration,
+                        high_percentile=self.dispersed_noise_percentile,
+                        dispersion_percentile=self.dispersed_noise_dispersion_percentile,
+                    )
+                    combined = combined * (1.0 - self.dispersed_noise_weight * disp_noise)
+                    _log(self.log_file, f"dispersed noise bins: {int(disp_noise.sum())} / {len(disp_noise)}")
+                    _log(self.log_file, f"dispersed_noise_weight: {self.dispersed_noise_weight}")
+
+                a_min, a_max = combined.min(), combined.max()
+                actioness = (
+                    (combined - a_min) / (a_max - a_min)
+                    if a_max > a_min
+                    else np.zeros_like(combined)
+                )
+
+                _log(self.log_file, f"actioness min/max: {actioness.min():.4f} / {actioness.max():.4f}")
+                _log(self.log_file, f"actioness mean: {actioness.mean():.4f}")
+
                 if self.use_adaptive_lambda:
-                    actioness_thresholds = get_adaptive_actioness_thresholds(
+                    thresholds = get_adaptive_actioness_thresholds(
                         actioness,
                         central_percentile=self.lambda_percentile,
                         delta=self.lambda_delta,
                         step=self.lambda_step,
                     )
-                    log_to_txt(self.log_file, f"adaptive thresholds: {actioness_thresholds.tolist()}")
+                    _log(self.log_file, f"adaptive thresholds: {thresholds.tolist()}")
                 else:
-                    actioness_thresholds = self.actioness_thresholds
-                    log_to_txt(self.log_file, f"fixed thresholds: {actioness_thresholds.tolist()}")
+                    thresholds = self.actioness_thresholds
+                    _log(self.log_file, f"fixed thresholds: {thresholds.tolist()}")
 
-                proposals = []
+                proposals = [
+                    proposal
+                    for at in thresholds
+                    for gt in self.grouping_thresholds
+                    for proposal in merge_proposals(
+                        get_index_proposals_from_1d_score(actioness, at),
+                        actioness, gt, bins,
+                    )
+                ]
 
-                for at in actioness_thresholds:
-                    for gt in self.grouping_thresholds:
-                        unmerged = get_index_proposals_from_1d_score(actioness, at)
-                        proposals += merge_proposals(unmerged, actioness, gt, bins)
-
-                log_to_txt(self.log_file, f"proposals raw: {len(proposals)}")
-
+                _log(self.log_file, f"proposals raw: {len(proposals)}")
                 proposals = np.array(proposals)
 
                 if len(proposals) > 0:
-                    proposals = proposals[proposals[:, 1] - proposals[:, 0] > 2 * 1e6]
+                    proposals = proposals[proposals[:, 1] - proposals[:, 0] > 2e6]
                     proposals = temporal_nms(proposals, self.nms_threshold)
-
-                    log_to_txt(self.log_file, f"proposals after NMS: {len(proposals)}")
-
+                    _log(self.log_file, f"proposals after NMS: {len(proposals)}")
                     if len(proposals) > 0:
                         durations = proposals[:, 1] - proposals[:, 0]
-                        log_to_txt(self.log_file, f"mean duration: {durations.mean():.2f}")
-                        log_to_txt(self.log_file, f"min duration: {durations.min():.2f}")
-                        log_to_txt(self.log_file, f"max duration: {durations.max():.2f}")
+                        _log(self.log_file, f"mean duration: {durations.mean():.2f}")
+                        _log(self.log_file, f"min duration:  {durations.min():.2f}")
+                        _log(self.log_file, f"max duration:  {durations.max():.2f}")
                     else:
-                        log_to_txt(self.log_file, "proposals after NMS: 0")
+                        _log(self.log_file, "proposals after NMS: 0")
                 else:
                     proposals = np.empty((0, 3))
-                    log_to_txt(self.log_file, "proposals after NMS: 0")
+                    _log(self.log_file, "proposals after NMS: 0")
 
                 rec_proposal_data[roi_id] = proposals
 
         return rec_proposal_data
-    
-    
-    def run(self):
-        """
-        Processes all recordings in the data directory to generate action proposals.
+
+    def run(self, split: Optional[str] = "test") -> pd.DataFrame:
+        """Process recordings and return proposals as a DataFrame.
+
+        Args:
+            split: If set, only process recordings whose HDF5 'split' attribute
+                matches this value. Pass None to process all recordings.
 
         Returns:
-            pd.DataFrame: DataFrame with all generated proposals.
+            DataFrame with columns [rec_name, roi_id, t_start, t_end, score].
         """
         logging.info("Running Proposal Generator.")
 
-        with h5py.File(self.data_path, "r") as f:
-            recordings = [rec for rec in f.keys() if f[rec].attrs["split"] == "test"]
+        with h5py.File(self.data_path, "r") as hf:
+            recordings = [
+                rec for rec in hf.keys()
+                if split is None or hf[rec].attrs.get("split") == split
+            ]
 
-        log_to_txt(self.log_file, f"\n[INFO] recordings found: {recordings}")
-
-        proposal_data = {}
+        _log(self.log_file, f"\n[INFO] recordings: {recordings}")
 
         with Pool(processes=16) as pool:
-          results = pool.map(self.process_recording, recordings)
+            results = pool.map(self.process_recording, recordings)
 
-        for rec, rec_proposals in zip(recordings, results):
-            rec_name = os.path.splitext(rec)[0]
-            proposal_data[rec_name] = rec_proposals
-
-        proposal_df = {
-            "rec_name": [],
-            "roi_id": [],
-            "t_start": [],
-            "t_end": [],
-            "score": [],
-        }
-
-        for rec_name, rec_proposals in proposal_data.items():
-            for roi_id, roi_proposals in rec_proposals.items():
-                for proposal in roi_proposals:
-                    proposal_df["rec_name"].append(rec_name)
-                    proposal_df["roi_id"].append(roi_id)
-                    proposal_df["t_start"].append(proposal[0])
-                    proposal_df["t_end"].append(proposal[1])
-                    proposal_df["score"].append(proposal[2])
-
-        return pd.DataFrame(proposal_df)
+        rows = [
+            {
+                "rec_name": os.path.splitext(rec)[0],
+                "roi_id":   roi_id,
+                "t_start":  proposal[0],
+                "t_end":    proposal[1],
+                "score":    proposal[2],
+            }
+            for rec, rec_proposals in zip(recordings, results)
+            for roi_id, proposals in rec_proposals.items()
+            for proposal in proposals
+        ]
+        return pd.DataFrame(rows)

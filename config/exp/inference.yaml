@@ -5,6 +5,22 @@ proposals:
   bin_width: 0.033  # s
   percentile: 1  # %
   nms_threshold: 0.95
+  use_adaptive_lambda: false
+  lambda_percentile: 75    # percentil do actionness como centro da grella de umbrais
+  lambda_delta: 0.20       # semianchura da grella ao redor do centro
+  lambda_step: 0.05        # paso entre umbrais consecutivos
+  use_spatial_compactness: false
+  spatial_weight: 0.2      # peso do descriptor espacial respecto á magnitude
+  use_noise_penalization: false
+  noise_percentile: 98       # percentil que define "actividade alta"
+  noise_min_duration: 20.0   # duración mínima en segundos para clasificar como ruído
+  noise_weight: 0.5          # factor de amortecemento sobre zonas de ruído
+  noise_variance_window: 10  # bins para a ventá de varianza local
+  use_dispersed_noise: false
+  dispersed_noise_percentile: 90          # percentil de rate que define "actividade alta"
+  dispersed_noise_dispersion_percentile: 20  # percentil de compacidade que define "moi disperso"
+  dispersed_noise_min_duration: 20.0      # duración mínima en segundos
+  dispersed_noise_weight: 0.5             # factor de amortecemento sobre zonas de neve/chuvia
 
 classification:
   # TSN

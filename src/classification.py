@@ -1,7 +1,14 @@
-import torch
+"""Proposal classification stage of the reTAG pipeline.
+
+Converts each temporal proposal into a time-surface image representation,
+runs it through AugmentedTSN, applies NMS, and returns JSON-formatted
+detections.
+"""
+
 import numpy as np
+import torch
 from PIL import Image
-from torchvision import transforms
+from torchvision import transforms as T
 from tqdm import tqdm
 from absl import logging
 from torch.utils.data import Dataset, DataLoader
@@ -11,151 +18,212 @@ from .augmented_tsn import AugmentedTsn
 from .utils import temporal_nms
 
 
-def range_norm(matrix, new_max=255, lower=None, upper=None, dtype=None):
-    if lower is None:
-        lower = np.min(matrix)
-    if upper is None:
-        upper = np.max(matrix)
+def range_norm(
+    matrix: np.ndarray,
+    new_max: float = 255,
+    lower: float = None,
+    upper: float = None,
+    dtype=None,
+) -> np.ndarray:
+    """Linearly rescale *matrix* to [0, new_max] after clipping to [lower, upper].
 
-    matrix = np.clip(matrix, lower, upper)
+    Args:
+        matrix: Input array.
+        new_max: Target maximum value after scaling.
+        lower: Clip minimum (defaults to matrix min).
+        upper: Clip maximum (defaults to matrix max).
+        dtype: Cast result to this dtype if provided.
 
-    scaled = new_max * ((matrix - lower) / (upper - lower))
-    if dtype is not None:
-        scaled = scaled.astype(dtype)
-    return scaled
+    Returns:
+        Scaled array of the same shape as *matrix*.
+    """
+    lower = matrix.min() if lower is None else lower
+    upper = matrix.max() if upper is None else upper
+    scaled = new_max * (np.clip(matrix, lower, upper) - lower) / (upper - lower)
+    return scaled.astype(dtype) if dtype is not None else scaled
 
 
-def create_time_map(events, decay, height, width):
+def create_time_map(
+    events: np.ndarray,
+    decay: float,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Build an exponential time-surface image from a set of events.
+
+    Each pixel stores the timestamp of the last event that fell there,
+    converted to an exponential decay score. Polarity is encoded as the sign.
+
+    Args:
+        events: Array of shape (N, 4) with columns [x, y, t, p].
+        decay: Decay constant for the exponential (larger = faster decay).
+        height: Image height in pixels.
+        width: Image width in pixels.
+
+    Returns:
+        Time-surface array of shape (height, width).
+    """
     time_map = np.zeros((height, width))
     time_map[events[:, 1], events[:, 0]] = events[:, 2]
 
-    current_t = np.amax(events[:, 2]) if len(events) > 0 else 0
-    time_map = np.exp(-decay * (current_t - time_map))
+    current_t = events[:, 2].max() if len(events) > 0 else 0
+    time_map  = np.exp(-decay * (current_t - time_map))
 
-    polarity = np.copy(events[:, 3]).astype(int)
-    polarity[np.where(events[:, 3] == 0)] = -1
+    polarity = events[:, 3].copy().astype(int)
+    polarity[polarity == 0] = -1
     time_map[events[:, 1], events[:, 0]] *= polarity
 
     return time_map
 
 
-def create_img_representation(events, decay, height, width, transforms=None):
+def create_img_representation(
+    events: np.ndarray,
+    decay: float,
+    height: int,
+    width: int,
+    transform=None,
+) -> np.ndarray:
+    """Convert events to a 224×224 RGB time-surface image.
+
+    Args:
+        events: Array of shape (N, 4) with columns [x, y, t, p].
+        decay: Exponential decay constant.
+        height: ROI height in pixels.
+        width: ROI width in pixels.
+        transform: Optional torchvision transform applied after conversion.
+
+    Returns:
+        Image array (or tensor if *transform* is set).
+    """
     img = create_time_map(events, decay, height, width)
     img = range_norm(img, lower=-1, upper=1, dtype=np.uint8)
     img = np.repeat(img[..., None], 3, axis=2)
-    img = Image.fromarray(img)
-    img = img.resize((224, 224), resample=Image.BILINEAR)
+    img = Image.fromarray(img).resize((224, 224), resample=Image.BILINEAR)
     img = np.array(img)
-
-    if transforms is not None:
-        img = transforms(img)
-
-    return img
+    return transform(img) if transform is not None else img
 
 
 class ProposalDataset(Dataset):
+    """PyTorch Dataset that builds TSN image stacks for each proposal.
+
+    Args:
+        proposals: DataFrame with columns [rec_name, roi_id, t_start, t_end].
+        augment_fraction: Fraction of the proposal duration added on each side.
+        data_path: Path to the preprocessed HDF5 file.
+        num_tsn_samples: Number of temporal samples per proposal.
+        sample_duration: Duration (µs) of each image window.
+        decay: Exponential decay constant for the time surface.
+    """
+
+    _transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
     def __init__(
         self,
         proposals,
-        augment_fraction,
-        data_path,
-        num_tsn_samples,
-        sample_duration,
-        decay,
+        augment_fraction: float,
+        data_path: str,
+        num_tsn_samples: int,
+        sample_duration: float,
+        decay: float,
     ):
-        self.proposals = proposals
+        self.proposals       = proposals
         self.augment_fraction = augment_fraction
-        self.data_path = data_path
+        self.data_path       = data_path
         self.num_tsn_samples = num_tsn_samples
         self.sample_duration = sample_duration
-        self.decay = decay
+        self.decay           = decay
 
-        self.transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.proposals)
 
     def __getitem__(self, idx):
-        t_start = self.proposals.loc[idx, "t_start"]
-        t_end = self.proposals.loc[idx, "t_end"]
+        t_start  = self.proposals.loc[idx, "t_start"]
+        t_end    = self.proposals.loc[idx, "t_end"]
         rec_name = self.proposals.loc[idx, "rec_name"]
-        roi_id = self.proposals.loc[idx, "roi_id"]
+        roi_id   = self.proposals.loc[idx, "roi_id"]
 
-        with h5py.File(self.data_path, "r") as file:
-            roi_events = np.array(file[rec_name][roi_id]["events"])
-            height = file[rec_name][roi_id].attrs["height"]
-            width = file[rec_name][roi_id].attrs["width"]
+        with h5py.File(self.data_path, "r") as hf:
+            roi_events = np.array(hf[rec_name][roi_id]["events"])
+            height     = hf[rec_name][roi_id].attrs["height"]
+            width      = hf[rec_name][roi_id].attrs["width"]
 
-        # Augment
-        t_delta = t_end - t_start
-        t_start_aug = t_start - t_delta * self.augment_fraction
-        t_end_aug = t_end + t_delta * self.augment_fraction
+        t_delta    = t_end - t_start
+        t_aug_start = t_start - t_delta * self.augment_fraction
+        t_aug_end   = t_end   + t_delta * self.augment_fraction
 
-        # Determine times where image representation is build
-        img_times = torch.linspace(t_start_aug, t_end_aug, self.num_tsn_samples)
-
-        # Build image representations at those times
+        img_times   = torch.linspace(t_aug_start, t_aug_end, self.num_tsn_samples)
         t_imgs_start = img_times - 0.5 * self.sample_duration
-        i_imgs_start = np.searchsorted(roi_events[:, 2], t_imgs_start)
+        t_imgs_end   = img_times + 0.5 * self.sample_duration
 
-        t_imgs_end = img_times + 0.5 * self.sample_duration
-        i_imgs_end = np.searchsorted(roi_events[:, 2], t_imgs_end)
+        i_start = np.searchsorted(roi_events[:, 2], t_imgs_start)
+        i_end   = np.searchsorted(roi_events[:, 2], t_imgs_end)
 
-        imgs = []
-
-        for i_start, i_end in zip(i_imgs_start, i_imgs_end):
-            events = roi_events[i_start:i_end]
-            imgs.append(
-                create_img_representation(
-                    events, self.decay, height, width, self.transforms
-                )
+        imgs = torch.stack([
+            create_img_representation(
+                roi_events[s:e], self.decay, height, width, self._transform
             )
-
-        imgs = torch.stack(imgs)
+            for s, e in zip(i_start, i_end)
+        ])
         return imgs, rec_name, roi_id, t_start, t_end
 
 
 class ProposalClassifier:
+    """Run AugmentedTSN inference on a proposal set and apply NMS.
+
+    Args:
+        device: Torch device for inference.
+        model_path: Path to the saved model state dict.
+        num_tsn_samples: Number of TSN samples in the main segment.
+        augment_factor: Controls the number of augmentation frames per side.
+        data_path: Path to the preprocessed HDF5 file.
+        sample_duration: Duration in seconds of each image window.
+        decay: Exponential decay constant.
+        nms_threshold: IoU threshold for temporal NMS.
+        batch_size: Inference batch size.
+    """
+
     def __init__(
         self,
         device,
-        model_path,
-        num_tsn_samples,
-        augment_factor,
-        data_path,
-        sample_duration,
-        decay,
-        nms_threshold,
-        batch_size,
+        model_path: str,
+        num_tsn_samples: int,
+        augment_factor: int,
+        data_path: str,
+        sample_duration: float,
+        decay: float,
+        nms_threshold: float,
+        batch_size: int,
     ) -> None:
-        self.device = device
+        self.device           = device
         self.augment_fraction = 1 / augment_factor
-        num_samples_augmented = np.ceil(self.augment_fraction * num_tsn_samples)
+        num_aug_samples       = int(np.ceil(self.augment_fraction * num_tsn_samples))
+        # Total samples = main + left-augment + right-augment
+        self.num_tsn_samples  = num_tsn_samples + 2 * num_aug_samples
 
-        # Proposal is augmented on each side and additional samples are considered
-        # within the augmentated times
-        self.num_tsn_samples = num_tsn_samples + int(2 * num_samples_augmented)
+        self.data_path     = data_path
+        self.sample_duration = 1e6 * sample_duration  # s → µs
+        self.decay         = float(decay)
+        self.nms_threshold = nms_threshold
+        self.batch_size    = batch_size
 
-        self.data_path = data_path
         self.model = AugmentedTsn(2, num_tsn_samples, augment_factor)
-        self.model.load_state_dict(torch.load(model_path,map_location=device)) # TODO: cambiar de volta a cuda eliminando map_location
+        self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.to(device).eval()
 
-        self.sample_duration = 1e6 * sample_duration  # [s] -> [us]
-        self.decay = float(decay)
+    def run(self, proposals) -> dict:
+        """Classify proposals and return detections in reTAG JSON format.
 
-        self.nms_threshold = nms_threshold
-        self.batch_size = batch_size
+        Args:
+            proposals: DataFrame with columns [rec_name, roi_id, t_start, t_end].
 
-    def run(self, proposals):
+        Returns:
+            Dict with keys "version" and "results" (nested by rec_name → roi_id).
+        """
         logging.info("Running Proposal Classifier.")
 
-        # Data Preparation
         dataset = ProposalDataset(
             proposals,
             self.augment_fraction,
@@ -164,61 +232,45 @@ class ProposalClassifier:
             self.sample_duration,
             self.decay,
         )
-        loader = DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=False, num_workers=16
-        )
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=16)
 
-        result = {}
-        rec_names = proposals["rec_name"].unique()
+        # Initialise result buckets for every (rec, roi) pair
+        result = {
+            rec: {roi: [] for roi in proposals[proposals["rec_name"] == rec]["roi_id"].unique()}
+            for rec in proposals["rec_name"].unique()
+        }
 
-        for rec in rec_names:
-            result[rec] = {}
-            rec_proposals = proposals[proposals["rec_name"] == rec]
-            roi_ids = rec_proposals["roi_id"].unique()
-
-            for roi_id in roi_ids:
-                result[rec][roi_id] = []
-
-        # Prediction
+        softmax = torch.nn.Softmax(dim=1)
         with torch.no_grad():
-            for batch in tqdm(loader):
-                imgs, rec_names, roi_ids, start_times, end_times = batch
-                outputs = self.model(imgs.to(self.device))
-
-                _, preds = torch.max(outputs, 1)
-                ed_scores = torch.nn.Softmax(dim=1)(outputs)[:, 1]
+            for imgs, rec_names, roi_ids, t_starts, t_ends in tqdm(loader):
+                outputs   = self.model(imgs.to(self.device))
+                preds     = outputs.argmax(dim=1)
+                ed_scores = softmax(outputs)[:, 1]
 
                 for i, pred in enumerate(preds):
                     if pred.item():
-                        rec_name, roi_id = rec_names[i], roi_ids[i]
-                        result[rec_name][roi_id].append(
-                            [
-                                float(start_times[i]),
-                                float(end_times[i]),
-                                float(ed_scores[i]),
-                            ]
-                        )
+                        result[rec_names[i]][roi_ids[i]].append([
+                            float(t_starts[i]),
+                            float(t_ends[i]),
+                            float(ed_scores[i]),
+                        ])
 
-        # Non-maximum Suppression
-        nmsed_result = {}
-
+        # Apply temporal NMS per (rec, roi)
+        nmsed = {}
         for rec_name, rec_results in result.items():
-            nmsed_result[rec_name] = {}
-
+            nmsed[rec_name] = {}
             for roi_id, roi_result in rec_results.items():
                 processed = (
                     temporal_nms(np.array(roi_result), self.nms_threshold)
-                    if roi_result
-                    else []
+                    if roi_result else []
                 )
-
-                nmsed_result[rec_name][int(roi_id[1:])] = [
+                nmsed[rec_name][int(roi_id[1:])] = [
                     {
-                        "label": "ed",
-                        "segment": [action[0] / 1e6, action[1] / 1e6],
-                        "score": action[2],
+                        "label":   "ed",
+                        "segment": [a[0] / 1e6, a[1] / 1e6],
+                        "score":   a[2],
                     }
-                    for action in processed
+                    for a in processed
                 ]
 
-        return {"version": "VERSION 0.0", "results": nmsed_result}
+        return {"version": "VERSION 0.0", "results": nmsed}

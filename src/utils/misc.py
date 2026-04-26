@@ -5,39 +5,41 @@ logger = logging.getLogger(__name__)
 
 
 def check_key_and_bool(config: dict, key: str) -> bool:
-    """Check the existance of the key and if it's True
+    """Return True only if *key* exists in *config* and its value is truthy.
 
     Args:
-        config (dict): dict.
-        key (str): Key name to be checked.
-
-    Returns:
-        bool: Return True only if the key exists in the dict and its value is True.
-            Otherwise returns False.
+        config: Configuration dictionary.
+        key: Key to check.
     """
-    return key in config.keys() and config[key]
+    return key in config and bool(config[key])
 
 
 def check_file_exists(filename: str) -> bool:
-    """Return True if the file exists.
+    """Return True if *filename* exists on disk; log a warning otherwise.
 
     Args:
-        filename (str): _description_
-
-    Returns:
-        bool: _description_
+        filename: Path to check.
     """
     logger.debug(f"Check {filename}")
-    res = os.path.exists(filename)
-    if not res:
+    exists = os.path.exists(filename)
+    if not exists:
         logger.warning(f"{filename} does not exist!")
-    return res
+    return exists
 
 
-def uniquify_dir(path):
-    filename, extension = os.path.splitext(path)
+def uniquify_dir(path: str) -> str:
+    """Append a counter suffix to *path* until it does not exist on disk.
+
+    Args:
+        path: Desired directory path.
+
+    Returns:
+        A path that does not yet exist: either *path* unchanged, or
+        *path*-1, *path*-2, … (extension preserved if any).
+    """
+    base, ext = os.path.splitext(path)
     counter = 1
     while os.path.exists(path):
-        path = f"{filename}-{counter}{extension}"
+        path = f"{base}-{counter}{ext}"
         counter += 1
     return path

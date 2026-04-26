@@ -1,60 +1,49 @@
-"""
-[EN]
-This script extracts a reduced subset of the event dataset for fast debugging.
-It copies one selected recording and a small set of ROIs into a new HDF5 file.
+"""Extract a small HDF5 subset for fast local debugging.
 
-[GL]
-Este script extrae un subconxunto reducido do dataset de eventos para depuración rápida.
-Copia unha gravación seleccionada e un conxunto pequeno de ROI a un novo ficheiro HDF5.
+Copies one recording and a fixed set of ROIs from the full dataset into a
+lightweight sample file. Run from the event_penguins/ directory:
+
+    python dev/extract_sample.py
 """
 
 from pathlib import Path
 import h5py
 
-from dev.utils import get_repo_root, get_local_config, ensure_dir
+_RECORDING     = "22-01-05_17-00-00"
+_ROIS          = ["N01", "N02"]
+_INPUT_PATH    = Path("data/preprocessed.h5")
+_OUTPUT_PATH   = Path("tmp/sample_preprocessed.h5")
 
 
-def main():
-    repo_root = get_repo_root()
-    cfg = get_local_config()
+def main() -> None:
+    if not _INPUT_PATH.exists():
+        raise FileNotFoundError(f"Input file not found: {_INPUT_PATH}")
 
-    input_path = repo_root / cfg["data"]["h5_path"]
-    output_path = repo_root / cfg["data"]["sample_h5_path"]
+    _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    ensure_dir(output_path.parent)
+    print(f"[INFO] Input:     {_INPUT_PATH}")
+    print(f"[INFO] Output:    {_OUTPUT_PATH}")
+    print(f"[INFO] Recording: {_RECORDING}")
+    print(f"[INFO] ROIs:      {_ROIS}")
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    with h5py.File(_INPUT_PATH, "r") as f_in, h5py.File(_OUTPUT_PATH, "w") as f_out:
+        if _RECORDING not in f_in:
+            raise KeyError(f"Recording not found in dataset: {_RECORDING}")
 
-    # Escolla manual para depuración
-    selected_recording = "22-01-05_17-00-00"
-    selected_rois = ["N01", "N02"]
+        rec_in  = f_in[_RECORDING]
+        rec_out = f_out.create_group(_RECORDING)
 
-    print(f"[INFO] Input file:  {input_path}")
-    print(f"[INFO] Output file: {output_path}")
-    print(f"[INFO] Recording:   {selected_recording}")
-    print(f"[INFO] ROIs:        {selected_rois}")
-
-    with h5py.File(input_path, "r") as f_in, h5py.File(output_path, "w") as f_out:
-        if selected_recording not in f_in:
-            raise KeyError(f"Recording not found: {selected_recording}")
-
-        rec_in = f_in[selected_recording]
-        rec_out = f_out.create_group(selected_recording)
-
-        # copiar atributos do recording se existen
         for key, value in rec_in.attrs.items():
             rec_out.attrs[key] = value
 
-        for roi in selected_rois:
+        for roi in _ROIS:
             if roi not in rec_in:
-                print(f"[WARN] ROI not found in recording: {roi}")
+                print(f"[WARN] ROI not found: {roi}")
                 continue
+            print(f"[INFO] Copying {_RECORDING}/{roi}")
+            f_in.copy(f"{_RECORDING}/{roi}", rec_out, name=roi)
 
-            print(f"[INFO] Copying {selected_recording}/{roi}")
-            f_in.copy(f"{selected_recording}/{roi}", rec_out, name=roi)
-
-    print("[DONE] Sample file created successfully.")
+    print(f"[DONE] Sample saved to {_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
