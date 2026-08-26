@@ -1,0 +1,30 @@
+diff --git a/libs/datasets/thumos14.py b/libs/datasets/thumos14.py
+index cda87c8..ff0de96 100644
+--- a/libs/datasets/thumos14.py
++++ b/libs/datasets/thumos14.py
+@@ -166,7 +166,11 @@ class THUMOS14Dataset(Dataset):
+             )
+             labels = torch.from_numpy(video_item['labels'])
+         else:
+-            segments, labels = None, None
++            if self.is_training:
++                segments = torch.empty((0, 2), dtype=torch.float32)
++                labels = torch.empty((0,), dtype=torch.int64)
++            else:
++                segments, labels = None, None
+ 
+         # return a data dict
+         data_dict = {'video_id'        : video_item['id'],
+@@ -179,9 +183,10 @@ class THUMOS14Dataset(Dataset):
+                      'feat_num_frames' : self.num_frames}
+ 
+         # truncate the features during training
+-        if self.is_training and (segments is not None):
++        if self.is_training:
+             data_dict = truncate_feats(
+-                data_dict, self.max_seq_len, self.trunc_thresh, feat_offset, self.crop_ratio
++                data_dict, self.max_seq_len, self.trunc_thresh, feat_offset,
++                self.crop_ratio, has_action=(segments.shape[0] > 0)
+             )
+ 
+         return data_dict

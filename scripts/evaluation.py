@@ -1,3 +1,12 @@
+"""Evaluate an existing prediction file against the ground-truth annotations.
+
+Useful when predictions were produced elsewhere (another node, an earlier run)
+and only the detection metrics are needed.
+
+Example:
+    python scripts/evaluation.py --prediction_path output/inference/run/predictions.json
+"""
+
 import sys
 import os
 import json
@@ -20,6 +29,7 @@ def propagate_config(config):
 
 
 def main(argv):
+    """Score ``--prediction_path`` at tIoU 0.1/0.3/0.5/0.7 and print mAP."""
     del argv
 
     with open(FLAGS.prediction_path, "r") as file:

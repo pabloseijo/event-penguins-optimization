@@ -1,0 +1,25 @@
+data:
+  h5_path: data/preprocessed.h5
+  sample_h5_path: tmp/sample_preprocessed.h5
+
+debug:
+  recording_key: null
+  roi_key: null
+  max_seconds: 20.0
+  max_events: 200000
+  output_dir: outputs/dev
+
+retag:
+  bin_size_ms: 10
+  lambda_values: [0.1, 0.2, 0.3, 0.4, 0.5]
+  mu_values: [0.1, 0.2, 0.3, 0.4, 0.5]
+  nms_threshold: 0.95
+  min_proposal_duration_s: 2.0
+
+proposals:
+  bin_width: 0.033
+  percentile: 1
+  use_adaptive_lambda: false
+
+profiling:
+  enabled: true

@@ -1,0 +1,3 @@
+I0405 17:00:47.743653 8505158720 inference.py:50] Device: cpu
+I0405 17:00:47.743978 8505158720 proposals.py:428] Running Proposal Generator.
+I0405 17:01:05.912364 8505158720 classification.py:156] Running Proposal Classifier.

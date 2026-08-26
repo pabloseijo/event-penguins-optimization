@@ -1,100 +1,97 @@
+"""Detection metrics: ActivityNet-style mAP and average recall.
+
+The evaluator reads an ActivityNet-style ground truth and prediction file and
+reports mean average precision over a set of tIoU thresholds, plus average recall
+for proposal-level analysis. The scope of an evaluation can be narrowed to a set
+of recordings, ROIs or labels, which is what makes per-fold and per-ROI numbers
+comparable with the full-split ones.
+"""
+
 import json
+import logging
 
 import numpy as np
 import pandas as pd
-from absl import logging
+from absl import logging as absl_logging
 
 try:
     from joblib import Parallel, delayed
+    _JOBLIB = True
+except ImportError:
+    _JOBLIB = False
 
-    joblib_parallelization = True
-except:
-    joblib_parallelization = False
+logger = logging.getLogger(__name__)
 
 
-class DetectionsEvaluator(object):
+class DetectionsEvaluator:
+    """Score a prediction file against the ground truth over several tIoU values.
+
+    Args:
+        ground_truth_filename: ActivityNet-style annotation file.
+        prediction_filename: prediction file written by the classification stage.
+        ground_truth_fields: required top-level fields of the annotation file.
+        prediction_fields: required top-level fields of the prediction file.
+        tiou_thresholds: tIoU thresholds averaged into the reported mAP.
+        verbose: print the resulting average mAP.
+        valid_sequences: restrict scoring to these recordings.
+        valid_roi_ids: restrict scoring to these ROIs.
+        valid_labels: restrict scoring to these labels.
+        min_duration: ground-truth instances shorter than this are ignored.
+
+    Raises:
+        IOError: if either filename is empty or cannot be read.
+    """
     GROUND_TRUTH_FIELDS = ["database", "version"]
     PREDICTION_FIELDS = ["results", "version"]
 
     def __init__(
         self,
-        ground_truth_filename=None,
-        prediction_filename=None,
-        ground_truth_fields=GROUND_TRUTH_FIELDS,
-        prediction_fields=PREDICTION_FIELDS,
-        tiou_thresholds=np.linspace(0.5, 0.95, 10),
-        verbose=False,
+        ground_truth_filename: str,
+        prediction_filename: str,
+        ground_truth_fields: list = GROUND_TRUTH_FIELDS,
+        prediction_fields: list = PREDICTION_FIELDS,
+        tiou_thresholds: np.ndarray = np.linspace(0.5, 0.95, 10),
+        verbose: bool = False,
         valid_sequences=None,
         valid_roi_ids=None,
         valid_labels=None,
         min_duration: float = 2.0,
     ):
         if not ground_truth_filename:
-            raise IOError("Please input a valid ground truth file.")
+            raise IOError("Introduce un ficheiro de ground truth válido.")
         if not prediction_filename:
-            raise IOError("Please input a valid prediction file.")
+            raise IOError("Introduce un ficheiro de predicións válido.")
+
         self.tiou_thresholds = tiou_thresholds
         self.verbose = verbose
         self.gt_fields = ground_truth_fields
         self.pred_fields = prediction_fields
         self.ap = None
-        # Import ground truth and predictions.
 
         self.ground_truth, self.activity_index = self._import_ground_truth(
-            ground_truth_filename,
-            valid_sequences,
-            valid_roi_ids,
-            valid_labels,
-            min_duration,
+            ground_truth_filename, valid_sequences, valid_roi_ids, valid_labels, min_duration
         )
         self.prediction = self._import_prediction(
-            prediction_filename,
-            valid_sequences,
-            valid_roi_ids,
-            valid_labels,
-            min_duration,
+            prediction_filename, valid_sequences, valid_roi_ids, valid_labels, min_duration
         )
 
         if self.verbose:
-            print("[INIT] Loaded annotations from {} subset.".format(subset))
-            nr_gt = len(self.ground_truth)
-            print("\tNumber of ground truth instances: {}".format(nr_gt))
-            nr_pred = len(self.prediction)
-            print("\tNumber of predictions: {}".format(nr_pred))
-            print("\tFixed threshold for tiou score: {}".format(self.tiou_thresholds))
+            print(f"[INIT] Anotacións cargadas: {len(self.ground_truth)} instancias.")
+            print(f"[INIT] Predicións cargadas: {len(self.prediction)} instancias.")
+            print(f"[INIT] Umbrais tIoU: {self.tiou_thresholds}")
 
-    def _import_ground_truth(
-        self,
-        ground_truth_filename,
-        valid_sequences,
-        valid_roi_ids,
-        valid_labels,
-        min_duration,
-    ):
-        """Reads ground truth file, checks if it is well formatted, and returns
-           the ground truth instances and the activity classes.
+    def _import_ground_truth(self, ground_truth_filename, valid_sequences,
+                              valid_roi_ids, valid_labels, min_duration):
+        with open(ground_truth_filename, "r") as f:
+            data = json.load(f)
 
-        Parameters
-        ----------
-        ground_truth_filename : str
-            Full path to the ground truth json file.
+        if not all(field in data for field in self.gt_fields):
+            raise IOError("Ficheiro de ground truth non válido.")
 
-        Outputs
-        -------
-        ground_truth : df
-            Data frame containing the ground truth instances.
-        activity_index : dict
-            Dictionary containing class index.
-        """
-        with open(ground_truth_filename, "r") as fobj:
-            data = json.load(fobj)
-        # Checking format
-        if not all([field in data.keys() for field in self.gt_fields]):
-            raise IOError("Please input a valid ground truth file.")
-
-        # Read ground truth data.
-        activity_index, cidx = {}, 0
+        activity_index: dict = {}
+        cidx = 0
         video_lst, t_start_lst, t_end_lst, label_lst = [], [], [], []
+
         for videoid, v in data["database"].items():
             if valid_sequences is not None and videoid not in valid_sequences:
                 continue
@@ -106,8 +103,7 @@ class DetectionsEvaluator(object):
                 for ann in roi_annotations:
                     if valid_labels is not None and ann["label"] not in valid_labels:
                         continue
-                    duration = ann["segment"][1] - ann["segment"][0]
-                    if duration < min_duration:
+                    if ann["segment"][1] - ann["segment"][0] < min_duration:
                         continue
                     if ann["label"] not in activity_index:
                         activity_index[ann["label"]] = cidx
@@ -117,46 +113,23 @@ class DetectionsEvaluator(object):
                     t_end_lst.append(float(ann["segment"][1]))
                     label_lst.append(activity_index[ann["label"]])
 
-        ground_truth = pd.DataFrame(
-            {
-                "video-id": video_lst,
-                "t-start": t_start_lst,
-                "t-end": t_end_lst,
-                "label": label_lst,
-            }
-        )
-        return ground_truth, activity_index
+        return pd.DataFrame({
+            "video-id": video_lst,
+            "t-start": t_start_lst,
+            "t-end": t_end_lst,
+            "label": label_lst,
+        }), activity_index
 
-    def _import_prediction(
-        self,
-        prediction_filename,
-        valid_sequences,
-        valid_roi_ids,
-        valid_labels,
-        min_duration,
-    ):
-        """Reads prediction file, checks if it is well formatted, and returns
-           the prediction instances.
+    def _import_prediction(self, prediction_filename, valid_sequences,
+                            valid_roi_ids, valid_labels, min_duration):
+        with open(prediction_filename, "r") as f:
+            data = json.load(f)
 
-        Parameters
-        ----------
-        prediction_filename : str
-            Full path to the prediction json file.
+        if not all(field in data for field in self.pred_fields):
+            raise IOError("Ficheiro de predicións non válido.")
 
-        Outputs
-        -------
-        prediction : df
-            Data frame containing the prediction instances.
-        """
-        with open(prediction_filename, "r") as fobj:
-            data = json.load(fobj)
-        # Checking format...
-        if not all([field in data.keys() for field in self.pred_fields]):
-            raise IOError("Please input a valid prediction file.")
+        video_lst, t_start_lst, t_end_lst, label_lst, score_lst = [], [], [], [], []
 
-        # Read predictions.
-        video_lst, t_start_lst, t_end_lst = [], [], []
-        label_lst, score_lst = [], []
         for videoid, v in data["results"].items():
             if valid_sequences is not None and videoid not in valid_sequences:
                 continue
@@ -168,246 +141,211 @@ class DetectionsEvaluator(object):
                 for result in roi_annotation:
                     if valid_labels is not None and result["label"] not in valid_labels:
                         continue
-                    duration = result["segment"][1] - result["segment"][0]
-                    if duration < min_duration:
+                    if result["segment"][1] - result["segment"][0] < min_duration:
                         continue
-                    label = self.activity_index[result["label"]]
                     video_lst.append(f"{videoid}_{roi_id}")
                     t_start_lst.append(float(result["segment"][0]))
                     t_end_lst.append(float(result["segment"][1]))
-                    label_lst.append(label)
+                    label_lst.append(self.activity_index[result["label"]])
                     score_lst.append(result["score"])
-        prediction = pd.DataFrame(
-            {
-                "video-id": video_lst,
-                "t-start": t_start_lst,
-                "t-end": t_end_lst,
-                "label": label_lst,
-                "score": score_lst,
-            }
-        )
-        return prediction
+
+        return pd.DataFrame({
+            "video-id": video_lst,
+            "t-start": t_start_lst,
+            "t-end": t_end_lst,
+            "label": label_lst,
+            "score": score_lst,
+        })
 
     def _get_predictions_with_label(self, prediction_by_label, label_name, cidx):
-        """Get all predicitons of the given label. Return empty DataFrame if there
-        is no predcitions with the given label.
-        """
         try:
             return prediction_by_label.get_group(cidx).reset_index(drop=True)
-        except:
-            print("Warning: No predictions of label '%s' were provdied." % label_name)
+        except KeyError:
+            absl_logging.warning(f"Sen predicións para a clase '{label_name}'.")
             return pd.DataFrame()
 
-    def wrapper_compute_average_precision(self):
-        """Computes average precision for each class in the subset."""
+    def wrapper_compute_average_precision(self) -> np.ndarray:
+        """Compute average precision per label and tIoU threshold, in parallel.
+
+        Returns:
+            ``[len(tiou_thresholds), num_labels]`` array of average precisions.
+        """
         ap = np.zeros((len(self.tiou_thresholds), len(self.activity_index)))
+        gt_by_label = self.ground_truth.groupby("label")
+        pred_by_label = self.prediction.groupby("label")
 
-        # Adaptation to query faster
-        ground_truth_by_label = self.ground_truth.groupby("label")
-        prediction_by_label = self.prediction.groupby("label")
-
-        if joblib_parallelization:
+        if _JOBLIB:
             results = Parallel(n_jobs=len(self.activity_index))(
                 delayed(compute_average_precision_detection)(
-                    ground_truth=ground_truth_by_label.get_group(cidx).reset_index(
-                        drop=True
-                    ),
-                    prediction=self._get_predictions_with_label(
-                        prediction_by_label, label_name, cidx
-                    ),
+                    ground_truth=gt_by_label.get_group(cidx).reset_index(drop=True),
+                    prediction=self._get_predictions_with_label(pred_by_label, name, cidx),
                     tiou_thresholds=self.tiou_thresholds,
                 )
-                for label_name, cidx in self.activity_index.items()
+                for name, cidx in self.activity_index.items()
             )
         else:
-            results = []
-            for label_name, cidx in self.activity_index.items():
-                results.append(
-                    compute_average_precision_detection(
-                        ground_truth=ground_truth_by_label.get_group(cidx).reset_index(
-                            drop=True
-                        ),
-                        prediction=self._get_predictions_with_label(
-                            prediction_by_label, label_name, cidx
-                        ),
-                        tiou_thresholds=self.tiou_thresholds,
-                    )
+            results = [
+                compute_average_precision_detection(
+                    ground_truth=gt_by_label.get_group(cidx).reset_index(drop=True),
+                    prediction=self._get_predictions_with_label(pred_by_label, name, cidx),
+                    tiou_thresholds=self.tiou_thresholds,
                 )
+                for name, cidx in self.activity_index.items()
+            ]
 
         for i, cidx in enumerate(self.activity_index.values()):
             ap[:, cidx] = results[i]
-
         return ap
 
-    def wrapper_compute_average_recall(self, max_pred=None):
-        """Computes average recall for each class in the subset."""
+    def wrapper_compute_average_recall(self, max_pred=None) -> np.ndarray:
+        """Compute average recall per label and tIoU threshold, in parallel.
+
+        Args:
+            max_pred: keep only the top-scoring predictions per recording, i.e. the
+                ``@k`` of AR@k. None keeps all of them.
+
+        Returns:
+            ``[len(tiou_thresholds), num_labels]`` array of average recalls.
+        """
         ar = np.zeros((len(self.tiou_thresholds), len(self.activity_index)))
+        gt_by_label = self.ground_truth.groupby("label")
+        pred_by_label = self.prediction.groupby("label")
 
-        # Adaptation to query faster
-        ground_truth_by_label = self.ground_truth.groupby("label")
-        prediction_by_label = self.prediction.groupby("label")
-
-        if joblib_parallelization:
+        if _JOBLIB:
             results = Parallel(n_jobs=len(self.activity_index))(
                 delayed(compute_average_recall)(
-                    ground_truth=ground_truth_by_label.get_group(cidx).reset_index(
-                        drop=True
-                    ),
-                    prediction=self._get_predictions_with_label(
-                        prediction_by_label, label_name, cidx
-                    ),
+                    ground_truth=gt_by_label.get_group(cidx).reset_index(drop=True),
+                    prediction=self._get_predictions_with_label(pred_by_label, name, cidx),
                     tiou_thresholds=self.tiou_thresholds,
                     max_pred=max_pred,
                 )
-                for label_name, cidx in self.activity_index.items()
+                for name, cidx in self.activity_index.items()
             )
         else:
-            results = []
-            for label_name, cidx in self.activity_index.items():
-                results.append(
-                    compute_average_recall(
-                        ground_truth=ground_truth_by_label.get_group(cidx).reset_index(
-                            drop=True
-                        ),
-                        prediction=self._get_predictions_with_label(
-                            prediction_by_label, label_name, cidx
-                        ),
-                        tiou_thresholds=self.tiou_thresholds,
-                        max_pred=max_pred,
-                    )
+            results = [
+                compute_average_recall(
+                    ground_truth=gt_by_label.get_group(cidx).reset_index(drop=True),
+                    prediction=self._get_predictions_with_label(pred_by_label, name, cidx),
+                    tiou_thresholds=self.tiou_thresholds,
+                    max_pred=max_pred,
                 )
+                for name, cidx in self.activity_index.items()
+            ]
 
         for i, cidx in enumerate(self.activity_index.values()):
             ar[:, cidx] = results[i]
-
         return ar
 
-    def run(self):
-        """Evaluates a prediction file. For the detection task we measure the
-        interpolated mean average precision to measure the performance of a
-        method.
+    def run(self) -> float:
+        """Return the average mAP over the configured tIoU thresholds.
+
+        The per-threshold mAP stays available as ``self.mAP`` and the per-label average
+        precision as ``self.ap``.
         """
         self.ap = self.wrapper_compute_average_precision()
-
         self.mAP = self.ap.mean(axis=1)
         self.average_mAP = self.mAP.mean()
 
         if self.verbose:
-            print("[RESULTS] Performance on ActivityNet detection task.")
-            print("\tAverage-mAP: {}".format(self.average_mAP))
-
+            print(f"[RESULTADOS] Average-mAP: {self.average_mAP:.4f}")
         return self.average_mAP
 
-    def evaluate_recall(self, max_pred=None):
-        # shape: [num_tiou_thresholds, num_classes]
+    def evaluate_recall(self, max_pred=None) -> pd.DataFrame:
+        """Return average recall as a DataFrame indexed by tIoU threshold.
+
+        Args:
+            max_pred: number of top-scoring predictions kept per recording.
+
+        Returns:
+            DataFrame with one ``tiou_threshold`` column and one column per label.
+        """
         self.ar = self.wrapper_compute_average_recall(max_pred=max_pred)
-        labels = [label for label in self.activity_index]
-        ar = pd.DataFrame(self.ar, columns=labels)
-        ar.insert(0, "tiou_threshold", self.tiou_thresholds)
-        return ar
+        labels = list(self.activity_index)
+        ar_df = pd.DataFrame(self.ar, columns=labels)
+        ar_df.insert(0, "tiou_threshold", self.tiou_thresholds)
+        return ar_df
 
 
-def segment_iou(target_segment, candidate_segments):
-    """Compute the temporal intersection over union between a
-    target segment and all the test segments.
+def segment_iou(target_segment: np.ndarray, candidate_segments: np.ndarray) -> np.ndarray:
+    """Temporal IoU between one segment and an array of candidate segments.
 
-    Parameters
-    ----------
-    target_segment : 1d array
-        Temporal target segment containing [starting, ending] times.
-    candidate_segments : 2d array
-        Temporal candidate segments containing N x [starting, ending] times.
+    Args:
+        target_segment: ``[t_start, t_end]`` of the reference segment.
+        candidate_segments: ``[n, 2]`` array of candidate segments.
 
-    Outputs
-    -------
-    tiou : 1d array
-        Temporal intersection over union score of the N's candidate segments.
+    Returns:
+        ``[n]`` array of tIoU values.
     """
     tt1 = np.maximum(target_segment[0], candidate_segments[:, 0])
     tt2 = np.minimum(target_segment[1], candidate_segments[:, 1])
-    # Intersection including Non-negative overlap score.
-    segments_intersection = (tt2 - tt1).clip(0)
-    # Segment union.
-    segments_union = (
+    intersection = (tt2 - tt1).clip(0)
+    union = (
         (candidate_segments[:, 1] - candidate_segments[:, 0])
         + (target_segment[1] - target_segment[0])
-        - segments_intersection
+        - intersection
     )
-    # Compute overlap as the ratio of the intersection
-    # over union of two segments.
-    tIoU = segments_intersection.astype(float) / segments_union
-    return tIoU
+    return intersection.astype(float) / union
 
 
-def interpolated_prec_rec(prec, rec):
-    """Interpolated AP - VOCdevkit from VOC 2011."""
+def interpolated_prec_rec(prec: np.ndarray, rec: np.ndarray) -> float:
+    """AP interpolada — VOCdevkit de VOC 2011."""
     mprec = np.hstack([[0], prec, [0]])
     mrec = np.hstack([[0], rec, [1]])
     for i in range(len(mprec) - 1)[::-1]:
         mprec[i] = max(mprec[i], mprec[i + 1])
-    idx = np.where(mrec[1::] != mrec[0:-1])[0] + 1
-    ap = np.sum((mrec[idx] - mrec[idx - 1]) * mprec[idx])
-    return ap
+    idx = np.where(mrec[1:] != mrec[:-1])[0] + 1
+    return float(np.sum((mrec[idx] - mrec[idx - 1]) * mprec[idx]))
 
 
 def compute_average_precision_detection(
-    ground_truth, prediction, tiou_thresholds=np.linspace(0.5, 0.95, 10)
-):
-    """Compute average precision (detection task) between ground truth and
-    predictions data frames. If multiple predictions occurs for the same
-    predicted segment, only the one with highest score is matches as
-    true positive. This code is greatly inspired by Pascal VOC devkit.
+    ground_truth: pd.DataFrame,
+    prediction: pd.DataFrame,
+    tiou_thresholds: np.ndarray = np.linspace(0.5, 0.95, 10),
+) -> np.ndarray:
+    """Average precision of one label, following the ActivityNet protocol.
 
-    Parameters
-    ----------
-    ground_truth : df
-        Data frame containing the ground truth instances.
-        Required fields: ['video-id', 't-start', 't-end']
-    prediction : df
-        Data frame containing the prediction instances.
-        Required fields: ['video-id, 't-start', 't-end', 'score']
-    tiou_thresholds : 1darray, optional
-        Temporal intersection over union threshold.
+    Predictions are ranked by score; a prediction is a true positive when it exceeds
+    the tIoU threshold against a ground-truth instance of the same recording that no
+    higher-scoring prediction has already claimed.
 
-    Outputs
-    -------
-    ap : float
-        Average precision score.
+    Args:
+        ground_truth: instances of this label, with ``video-id``, ``t-start``, ``t-end``.
+        prediction: predictions of this label, with an extra ``score`` column.
+        tiou_thresholds: thresholds to evaluate.
+
+    Returns:
+        ``[len(tiou_thresholds)]`` array of average precisions; zeros when there is
+        no prediction.
     """
     ap = np.zeros(len(tiou_thresholds))
     if prediction.empty:
-        logging.warning("Evaluator returned 0 due to empty predictions!")
+        absl_logging.warning("Avaliador devolveu 0 por predicións baleiras.")
         return ap
 
     npos = float(len(ground_truth))
-    lock_gt = np.ones((len(tiou_thresholds), len(ground_truth))) * -1
-    # Sort predictions by decreasing score order.
+    lock_gt = np.full((len(tiou_thresholds), len(ground_truth)), -1)
     sort_idx = prediction["score"].values.argsort()[::-1]
     prediction = prediction.loc[sort_idx].reset_index(drop=True)
 
-    # Initialize true positive and false positive vectors.
     tp = np.zeros((len(tiou_thresholds), len(prediction)))
     fp = np.zeros((len(tiou_thresholds), len(prediction)))
 
-    # Adaptation to query faster
-    ground_truth_gbvn = ground_truth.groupby("video-id")
+    gt_by_video = ground_truth.groupby("video-id")
 
-    # Assigning true positive to truly grount truth instances.
     for idx, this_pred in prediction.iterrows():
-
         try:
-            # Check if there is at least one ground truth in the video associated.
-            ground_truth_videoid = ground_truth_gbvn.get_group(this_pred["video-id"])
-        except Exception as e:
+            gt_video = gt_by_video.get_group(this_pred["video-id"])
+        except KeyError:
             fp[:, idx] = 1
             continue
 
-        this_gt = ground_truth_videoid.reset_index()
+        this_gt = gt_video.reset_index()
         tiou_arr = segment_iou(
-            this_pred[["t-start", "t-end"]].values, this_gt[["t-start", "t-end"]].values
+            this_pred[["t-start", "t-end"]].values,
+            this_gt[["t-start", "t-end"]].values,
         )
-        # We would like to retrieve the predictions with highest tiou score.
         tiou_sorted_idx = tiou_arr.argsort()[::-1]
+
         for tidx, tiou_thr in enumerate(tiou_thresholds):
             for jdx in tiou_sorted_idx:
                 if tiou_arr[jdx] < tiou_thr:
@@ -415,72 +353,71 @@ def compute_average_precision_detection(
                     break
                 if lock_gt[tidx, this_gt.loc[jdx]["index"]] >= 0:
                     continue
-                # Assign as true positive after the filters above.
                 tp[tidx, idx] = 1
                 lock_gt[tidx, this_gt.loc[jdx]["index"]] = idx
                 break
-
             if fp[tidx, idx] == 0 and tp[tidx, idx] == 0:
                 fp[tidx, idx] = 1
 
     tp_cumsum = np.cumsum(tp, axis=1).astype(float)
     fp_cumsum = np.cumsum(fp, axis=1).astype(float)
     recall_cumsum = tp_cumsum / npos
-
     precision_cumsum = tp_cumsum / (tp_cumsum + fp_cumsum)
 
     for tidx in range(len(tiou_thresholds)):
-        ap[tidx] = interpolated_prec_rec(
-            precision_cumsum[tidx, :], recall_cumsum[tidx, :]
-        )
-
+        ap[tidx] = interpolated_prec_rec(precision_cumsum[tidx], recall_cumsum[tidx])
     return ap
 
 
 def compute_average_recall(
-    ground_truth, prediction, tiou_thresholds=np.linspace(0.5, 0.95, 10), max_pred=None
-):
+    ground_truth: pd.DataFrame,
+    prediction: pd.DataFrame,
+    tiou_thresholds: np.ndarray = np.linspace(0.5, 0.95, 10),
+    max_pred: int = None,
+) -> np.ndarray:
+    """Fraction of ground-truth instances recovered by the top predictions.
+
+    An instance counts as recovered when any kept prediction of its recording reaches
+    the tIoU threshold, regardless of rank. This is the proposal-level metric used to
+    compare proposal generators independently of the classifier.
+
+    Args:
+        ground_truth: instances of this label.
+        prediction: predictions of this label.
+        tiou_thresholds: thresholds to evaluate.
+        max_pred: predictions kept per recording, i.e. the ``@k`` of AR@k.
+
+    Returns:
+        ``[len(tiou_thresholds)]`` array of recall values.
+    """
     if prediction.empty:
-        logging.warning("Evaluator returned 0 due to empty predictions!")
+        absl_logging.warning("Avaliador devolveu 0 por predicións baleiras.")
         return np.zeros(len(tiou_thresholds))
 
-    # Filter videos as top x
     video_ids = ground_truth["video-id"].unique()
-    filtered_prediction = None
-    for video_id in video_ids:
-        vid_prediction = prediction[prediction["video-id"] == video_id].reset_index(
-            drop=True
-        )
-        sort_idx = vid_prediction["score"].values.argsort()[::-1]
-        vid_prediction = vid_prediction.loc[sort_idx].reset_index(drop=True)
-        vid_prediction = vid_prediction.head(max_pred).reset_index(drop=True)
-        if filtered_prediction is None:
-            filtered_prediction = vid_prediction
-        else:
-            filtered_prediction = pd.concat(
-                [filtered_prediction, vid_prediction], ignore_index=True
-            )
+    filtered = pd.concat(
+        [
+            prediction[prediction["video-id"] == vid]
+            .sort_values("score", ascending=False)
+            .head(max_pred)
+            for vid in video_ids
+        ],
+        ignore_index=True,
+    )
 
-    prediction = filtered_prediction
-    prediction_gbvn = prediction.groupby("video-id")
-
+    pred_by_video = filtered.groupby("video-id")
     tp = np.zeros(len(tiou_thresholds), dtype=int)
 
-    for idx, this_gt in ground_truth.iterrows():
-        if not this_gt["video-id"] in prediction_gbvn.groups.keys():
-            logger.warning(
-                f"No predictions for sequence {this_gt['video-id']}. Skipping."
-            )
+    for _, this_gt in ground_truth.iterrows():
+        vid = this_gt["video-id"]
+        if vid not in pred_by_video.groups:
+            logger.warning(f"Sen predicións para {vid}. Omitindo.")
             continue
-        pred_videoid = prediction_gbvn.get_group(this_gt["video-id"])
-        this_pred = pred_videoid.reset_index()
-
+        this_pred = pred_by_video.get_group(vid).reset_index(drop=True)
         tiou_arr = segment_iou(
-            this_gt[["t-start", "t-end"]].values, this_pred[["t-start", "t-end"]].values
+            this_gt[["t-start", "t-end"]].values,
+            this_pred[["t-start", "t-end"]].values,
         )
+        tp += tiou_thresholds <= np.max(tiou_arr)
 
-        max_tiou = np.max(tiou_arr)
-        tp += tiou_thresholds <= max_tiou
-
-    ar = tp / len(ground_truth)
-    return ar
+    return tp / len(ground_truth)
