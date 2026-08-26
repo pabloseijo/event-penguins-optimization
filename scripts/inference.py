@@ -1,3 +1,13 @@
+"""Run the full two-stage pipeline end to end and report mAP.
+
+Proposal generation, proposal classification and detection evaluation are driven
+by a single YAML config; results, logs and a copy of the config land in a fresh
+output directory.
+
+Example:
+    python scripts/inference.py --config config/exp/inference.yaml --verbose
+"""
+
 import sys
 import os
 import json
@@ -30,12 +40,14 @@ flags.DEFINE_boolean(
 
 
 def propagate_config(config):
+    """Copy the shared ``common`` entries into each per-stage config block."""
     config["proposals"]["data_path"] = config["common"]["data_path"]
     config["classification"]["data_path"] = config["common"]["data_path"]
     return config
 
 
 def main(argv):
+    """Generate proposals, classify them, dump predictions and evaluate mAP."""
     del argv
     logging.set_verbosity(FLAGS.log_level.upper())
     root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")

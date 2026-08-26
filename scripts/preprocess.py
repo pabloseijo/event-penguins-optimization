@@ -1,3 +1,17 @@
+"""Build the HDF5 dataset from raw recordings and nest annotations.
+
+Crops the event stream of every recording to the annotated regions of interest
+(one per nest), stores each ROI under its recording group and stamps the split
+from ``recording_info.csv``. The result, ``preprocessed.h5``, is the single input
+of every other stage.
+
+Example:
+    python scripts/preprocess.py \\
+        --data_root data/EventPenguins \\
+        --output_dir data \\
+        --recording_info_path config/annotations/recording_info.csv
+"""
+
 # Create the data split with this script.
 # The script crops the events according to the regions of interest,
 # and saves them as .npz in folder according to the data split
@@ -11,6 +25,7 @@ import pandas as pd
 
 
 def parse_args():
+    """Parse the data root, the output directory and the recording-info CSV."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data_root",
