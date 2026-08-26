@@ -1,0 +1,16 @@
+diff --git a/v2ecore/slomo.py b/v2ecore/slomo.py
+index b780d24..da74162 100644
+--- a/v2ecore/slomo.py
++++ b/v2ecore/slomo.py
+@@ -135,7 +135,10 @@ class SuperSloMo:
+                 'closing slomo video AVI {} after '
+                 'writing {} frames'.format(self.vid_slomo, self.numSlomoVideoFramesWritten))
+             self.slomo_writer.release()
+-        cv2.destroyAllWindows()
++        try:
++            cv2.destroyAllWindows()
++        except cv2.error:
++            pass
+ 
+     def __transform(self):
+         """create the Transform instances.

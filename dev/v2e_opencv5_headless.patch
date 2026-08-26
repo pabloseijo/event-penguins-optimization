@@ -1,0 +1,15 @@
+diff --git a/v2e.py b/v2e.py
+index 6b214ab..24bc654 100755
+--- a/v2e.py
++++ b/v2e.py
+@@ -657,8 +657,9 @@ def main():
+                 inputWidth = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                 inputHeight = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+-                inputChannels = 1 if int(cap.get(cv2.CAP_PROP_MONOCHROME)) \
+-                    else 3
++                # OpenCV 5 may return -1 for an unknown monochrome property.
++                # Only a positive value means that the decoded frames are grayscale.
++                inputChannels = 1 if cap.get(cv2.CAP_PROP_MONOCHROME) > 0 else 3
+             logger.info(
+                 'Input video {} has W={} x H={} frames each with {} channels'
+                 .format(input_file, inputWidth, inputHeight, inputChannels))

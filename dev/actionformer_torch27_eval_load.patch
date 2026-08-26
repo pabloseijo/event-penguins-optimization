@@ -1,0 +1,14 @@
+diff --git a/eval.py b/eval.py
+index d032254..511cacd 100644
+--- a/eval.py
++++ b/eval.py
+@@ -69,7 +69,8 @@ def main(args):
+     # load ckpt, reset epoch / best rmse
+     checkpoint = torch.load(
+         ckpt_file,
+-        map_location = lambda storage, loc: storage.cuda(cfg['devices'][0])
++        map_location=cfg['devices'][0],
++        weights_only=False,
+     )
+     # load ema model instead
+     print("Loading from EMA model ...")

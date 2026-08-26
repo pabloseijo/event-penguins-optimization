@@ -1,0 +1,9 @@
+diff --git a/libs/utils/metrics.py b/libs/utils/metrics.py
+index 96e2389..a3e080f 100644
+--- a/libs/utils/metrics.py
++++ b/libs/utils/metrics.py
+@@ -324,2 +324,2 @@
+-    tp_cumsum = np.cumsum(tp, axis=1).astype(np.float)
+-    fp_cumsum = np.cumsum(fp, axis=1).astype(np.float)
++    tp_cumsum = np.cumsum(tp, axis=1).astype(float)
++    fp_cumsum = np.cumsum(fp, axis=1).astype(float)
