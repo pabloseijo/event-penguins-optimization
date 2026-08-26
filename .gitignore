@@ -1,33 +1,43 @@
 # =========================
-# DATASETS (CRÍTICO)
+# DATASETS (critical: never commit event data)
 # =========================
 data/
-tmp/
 dev/data/
-
-# HDF5 files
+tmp/
 *.h5
+*.npz
 
 # =========================
-# MODELS
+# MODELS AND CHECKPOINTS
 # =========================
 models/
 *.pt
 *.pth
 *.ckpt
+*.pk
 
 # =========================
-# DEBUG / LOGS
+# EXTERNAL REPOSITORIES
 # =========================
+# ActionFormer is expected here for the cross-domain arm, but is not vendored
+libs/
+v2e/
+
+# =========================
+# RUN OUTPUT, DEBUG AND LOGS
+# =========================
+outputs/
 *.txt
 *.log
+!requirements.txt
 
 # =========================
 # PYTHON
 # =========================
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+.eggs/
 
 # =========================
 # ENVIRONMENTS
@@ -36,6 +46,9 @@ __pycache__/
 .venv/
 
 # =========================
-# OS / MISC
+# EDITORS / OS
 # =========================
 .DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/

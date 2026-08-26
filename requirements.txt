@@ -1,6 +1,27 @@
-PyYAML~=6.0.1
-h5py~=3.7.0
+# Runtime dependencies of the CoTAD pipeline.
+#
+# PyTorch is intentionally not pinned here: install the build that matches your
+# CUDA version first (see pytorch.org), then run `pip install -r requirements.txt`.
+#   pip install torch torchvision
+#
+# Optional, not required by the pipeline itself:
+#   v2e          — only to rebuild the THUMOS14-E event corpus
+#   actionformer — only to run the cross-domain comparison arm (expected as libs/)
+
+# arrays, tables and storage
+numpy~=1.24.3
 pandas~=1.5.2
-joblib~=1.4.0
+h5py~=3.7.0
+
+# configuration, flags and logging
+PyYAML~=6.0.1
 absl-py
+
+# models and imaging
+timm==1.0.20
+Pillow~=10.4.0
+
+# parallelism, progress and figures
+joblib~=1.4.0
 tqdm
+matplotlib~=3.7.5
