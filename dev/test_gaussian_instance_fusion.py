@@ -1,10 +1,3 @@
-"""Tests for gaussian instance fusion of overlapping candidates.
-
-Checks the numerically stable softmax, that suppressed overlap uses the candidate
-duration, that fusion moves a boundary towards the higher-scoring candidate, and
-that the conservative variant preserves the detection count and scores.
-"""
-
 from __future__ import annotations
 
 import unittest

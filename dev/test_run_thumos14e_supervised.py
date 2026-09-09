@@ -1,10 +1,3 @@
-"""Tests for the supervised THUMOS14-E runner and its protocol locks.
-
-Checks that the protocol is one corpus with canonical counts, that annotation
-views come from the assembler directory, that the corpus and the conversion role
-stay locked, and that a fold manifest can never include test videos.
-"""
-
 from __future__ import annotations
 
 import tempfile

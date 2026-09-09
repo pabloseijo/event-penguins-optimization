@@ -1,10 +1,3 @@
-"""Boundary-Sensitive Pretext task (Xu et al., ICCV 2021) over cached features.
-
-The pretext synthesises four kinds of temporal boundary from ordered proposal
-features and asks the shared representation to tell them apart, which pushes the
-encoder to represent boundaries rather than only interior appearance.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -107,18 +100,6 @@ class BoundaryTypeHead(nn.Module):
 
 
 def boundary_type_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Cross entropy over the four synthesized boundary types.
-
-    Args:
-        logits: ``[B, 4]`` predictions from :class:`BoundaryTypeHead`.
-        targets: ``[B]`` boundary type indices.
-
-    Returns:
-        Scalar loss.
-
-    Raises:
-        ValueError: if the logits do not have four columns.
-    """
     if logits.ndim != 2 or logits.shape[1] != NUM_BOUNDARY_TYPES:
         raise ValueError(f"Expected BSP logits with shape [B,{NUM_BOUNDARY_TYPES}]")
     return F.cross_entropy(logits, targets)

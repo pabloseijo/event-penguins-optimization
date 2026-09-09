@@ -89,43 +89,6 @@ def classwise_percentile_ranks(
     ]
 
 
-def fit_classwise_ecdf(
-    videos: Sequence[Mapping[str, np.ndarray]],
-    values: Sequence[np.ndarray],
-    num_classes: int,
-) -> List[np.ndarray]:
-    labels = np.concatenate([video["labels"] for video in videos])
-    merged_values = np.concatenate(values)
-    return [
-        np.sort(merged_values[labels == label]).astype(np.float32)
-        for label in range(num_classes)
-    ]
-
-
-def apply_classwise_ecdf(
-    videos: Sequence[Mapping[str, np.ndarray]],
-    values: Sequence[np.ndarray],
-    references: Sequence[np.ndarray],
-) -> List[np.ndarray]:
-    transformed = []
-    for video, video_values in zip(videos, values):
-        ranks = np.full(len(video_values), 0.5, dtype=np.float32)
-        for label in np.unique(video["labels"]):
-            indices = np.flatnonzero(video["labels"] == label)
-            reference = np.asarray(references[int(label)])
-            if len(reference) == 0:
-                continue
-            left = np.searchsorted(
-                reference, video_values[indices], side="left"
-            )
-            right = np.searchsorted(
-                reference, video_values[indices], side="right"
-            )
-            ranks[indices] = (left + right) / (2.0 * len(reference))
-        transformed.append(ranks)
-    return transformed
-
-
 def sigmoid(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     return np.where(
@@ -254,29 +217,19 @@ def temperature_scores(
 
 
 def completeness_scores(
-    training_videos: Sequence[Mapping[str, np.ndarray]],
     videos: Sequence[Mapping[str, np.ndarray]],
     weight: float,
-    num_classes: int,
 ) -> List[np.ndarray]:
+    original = classwise_percentile_ranks(
+        videos, [video["scores"] for video in videos]
+    )
     completeness_index = list(videos[0]["feature_names"]).index("completeness")
-    training_raw = [video["scores"] for video in training_videos]
-    validation_raw = [video["scores"] for video in videos]
-    raw_references = fit_classwise_ecdf(
-        training_videos, training_raw, num_classes
-    )
-    original = apply_classwise_ecdf(videos, validation_raw, raw_references)
-    training_completeness = [
-        video["features"][:, completeness_index] for video in training_videos
-    ]
-    validation_completeness = [
-        video["features"][:, completeness_index] for video in videos
-    ]
-    completeness_references = fit_classwise_ecdf(
-        training_videos, training_completeness, num_classes
-    )
-    completeness = apply_classwise_ecdf(
-        videos, validation_completeness, completeness_references
+    completeness = classwise_percentile_ranks(
+        videos,
+        [
+            video["features"][:, completeness_index]
+            for video in videos
+        ],
     )
     return [
         (1.0 - weight) * raw_rank + weight * completeness_rank
@@ -549,9 +502,6 @@ def main() -> None:
             for index, candidate_fold in enumerate(all_folds)
             if index != fold
         ]
-        training_videos = [
-            video for training_fold in training_folds for video in training_fold
-        ]
         temperatures = fit_temperatures(training_folds, num_classes)
         duration_upper, duration_scale = load_duration_prior(
             annotation_path,
@@ -562,9 +512,7 @@ def main() -> None:
         raw_scores = [video["scores"] for video in videos]
         calibrated_scores = temperature_scores(videos, temperatures)
         completeness_by_weight = {
-            weight: completeness_scores(
-                training_videos, videos, weight, num_classes
-            )
+            weight: completeness_scores(videos, weight)
             for weight in (0.10, 0.25, 0.50)
         }
         variants = [
@@ -575,16 +523,6 @@ def main() -> None:
             ("soft075", raw_scores, "soft", 0.75, 0.0),
             ("temperature_oof", calibrated_scores, "soft", 0.50, 0.0),
         ]
-        for threshold in (0.50, 0.70, 0.90):
-            variants.append(
-                (
-                    f"raw_voting{threshold:g}",
-                    raw_scores,
-                    "soft",
-                    0.50,
-                    threshold,
-                )
-            )
         for gamma in (0.50, 1.00):
             variants.append(
                 (

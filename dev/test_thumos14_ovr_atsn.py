@@ -1,10 +1,3 @@
-"""Tests for the one-versus-rest ATSN training on THUMOS14-E.
-
-Checks that the final fit uses all validation videos and never test, that fold
-selection is video-disjoint, that labels use strict IoU and ignore ambiguous
-overlap, and that negative downsampling is stable while keeping every positive.
-"""
-
 from __future__ import annotations
 
 import csv

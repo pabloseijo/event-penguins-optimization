@@ -1,10 +1,3 @@
-"""Tests for the assembly of the THUMOS14 event corpus.
-
-Checks that a fork shares sources while separating conversion outputs, that
-parsing preserves every label and the ambiguous regions, that multilabel folds are
-deterministic and cover every class, and that shards are disjoint.
-"""
-
 from __future__ import annotations
 
 import csv

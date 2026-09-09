@@ -14,15 +14,11 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Repository root holding the proposal artifacts of both domains. Defaults to the
-# repository this file lives in; override with EVENT_PENGUINS_ROOT when the
-# artifacts sit elsewhere, as they do on the experiment server.
-ROOT = Path(os.environ.get("EVENT_PENGUINS_ROOT", Path(__file__).resolve().parent.parent))
+ROOT = Path("/home/pablo.garcia.seijo/event_penguins")
 csv.field_size_limit(sys.maxsize)
 
 

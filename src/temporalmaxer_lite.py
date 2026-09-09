@@ -1,15 +1,3 @@
-"""Proposal-local dense head over ordered ATSN features (phase 4).
-
-The head keeps the temporal sequence of a proposal instead of pooling it away and
-gathers context with parameter-free max pooling, as in TemporalMaxer. It predicts
-per-point actionness and quality, start and end boundary maps and boundary
-distances, which is what makes boundary voting possible.
-
-This is the proposal-local predecessor of
-:mod:`src.temporalmaxer_continuous`, which consumes the whole ROI timeline
-instead and became the architecture of the final system.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -203,16 +191,6 @@ class TemporalMaxerLiteHead(nn.Module):
         return self._temporal_pyramid(x)
 
     def forward(self, frame_features: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Predict per-point actionness, quality and boundaries for a proposal.
-
-        Args:
-            frame_features: ``[B, T, input_dim]`` ordered proposal features.
-
-        Returns:
-            Dictionary with ``action_logits``, ``point_quality_logits``, ``start_logits``,
-            ``end_logits``, ``boundary_distances``, ``trident_offsets_bins``,
-            ``quality_logit`` and ``boundary_deltas``.
-        """
         shared = self.encode_shared(frame_features)
         if self.training and self.tanp_sigma > 0:
             shared = temporal_aware_normalization_perturbation(shared, self.tanp_sigma)

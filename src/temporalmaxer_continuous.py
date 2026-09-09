@@ -33,7 +33,6 @@ class ChannelLayerNorm(nn.Module):
 
 
 class Scale(nn.Module):
-    """Learnable per-level scalar, used to rescale regression outputs."""
     def __init__(self) -> None:
         super().__init__()
         self.value = nn.Parameter(torch.tensor(1.0))
@@ -89,7 +88,6 @@ def temporal_aware_normalization_perturbation(
 
 
 class TemporalTower(nn.Module):
-    """Stack of masked 1-D convolution blocks shared by one detection head."""
     def __init__(self, channels: int, layers: int, dropout: float) -> None:
         super().__init__()
         blocks = []
@@ -108,90 +106,12 @@ class TemporalTower(nn.Module):
         return self.blocks(value) * mask.to(value.dtype)
 
 
-class LocalSelfAttentionBlock(nn.Module):
-    """ActionFormer-style local self-attention over one pyramid level.
-
-    Only used when the model is built with ``neck_type="attention"``. It exists so
-    the paper can compare the max-pool neck against windowed attention while holding
-    the features, the pyramid, the heads and the protocol fixed.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        heads: int = 4,
-        window: int = 19,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        if window < 1 or window % 2 == 0:
-            raise ValueError("window must be a positive odd number of bins")
-        self.window = window
-        self.heads = heads
-        self.norm_attention = ChannelLayerNorm(channels)
-        self.attention = nn.MultiheadAttention(
-            channels, heads, dropout=dropout, batch_first=True
-        )
-        self.norm_ffn = ChannelLayerNorm(channels)
-        self.ffn = nn.Sequential(
-            nn.Conv1d(channels, channels * 4, kernel_size=1),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(channels * 4, channels, kernel_size=1),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def _attention_mask(self, mask: torch.Tensor) -> torch.Tensor:
-        """Window plus padding, with the diagonal always left open.
-
-        A query whose every key is masked makes softmax return NaN, and clamping the
-        output afterwards does not stop the NaN from reaching the gradient. Keeping
-        each position attending to itself removes the degenerate row entirely.
-        """
-        valid = mask.reshape(mask.shape[0], -1).bool()
-        batch, length = valid.shape
-        index = torch.arange(length, device=mask.device)
-        outside_window = (index[:, None] - index[None, :]).abs() > (self.window // 2)
-        blocked = outside_window[None] | ~valid[:, None, :]
-        blocked = blocked & ~torch.eye(length, dtype=torch.bool, device=mask.device)
-        return blocked.repeat_interleave(self.heads, dim=0)
-
-    def forward(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        residual = value
-        normed = self.norm_attention(value).transpose(1, 2)
-        attended, _ = self.attention(
-            normed,
-            normed,
-            normed,
-            attn_mask=self._attention_mask(mask),
-            need_weights=False,
-        )
-        attended = attended.transpose(1, 2)
-        value = (residual + self.dropout(attended)) * mask.to(value.dtype)
-        value = value + self.dropout(self.ffn(self.norm_ffn(value)))
-        return value * mask.to(value.dtype)
-
-
 def sigmoid_focal_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     alpha: float = 0.25,
     gamma: float = 2.0,
 ) -> torch.Tensor:
-    """Focal loss over per-point action logits.
-
-    A continuous ROI timeline is overwhelmingly background, so an unweighted loss is
-    dominated by easy negatives. Focal loss down-weights them.
-
-    Args:
-        logits: raw per-point logits.
-        targets: per-point targets in ``{0, 1}``.
-        alpha: weight of the positive class.
-        gamma: focusing exponent.
-
-    Returns:
-        Per-point loss, left unreduced so the caller can normalise by positives.
-    """
     probabilities = logits.sigmoid()
     ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     p_t = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
@@ -200,19 +120,6 @@ def sigmoid_focal_loss(
 
 
 def center_diou_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Distance-IoU loss between predicted and target boundary distances.
-
-    Segments are parameterised as ``[left, right]`` distances from the point. The
-    distance term keeps gradients alive when two segments do not overlap at all,
-    where plain IoU is flat.
-
-    Args:
-        predicted: ``[n, 2]`` predicted distances.
-        target: ``[n, 2]`` target distances.
-
-    Returns:
-        Per-sample loss.
-    """
     pred_left, pred_right = predicted[:, 0], predicted[:, 1]
     gt_left, gt_right = target[:, 0], target[:, 1]
     intersection = torch.minimum(pred_left, gt_left) + torch.minimum(pred_right, gt_right)
@@ -224,12 +131,6 @@ def center_diou_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Ten
 
 
 def center_iou(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Temporal IoU between predicted and target ``[left, right]`` distances.
-
-    This is the target of the quality head: a point predicts how good its own
-    regression is, which is what lets ranking use localisation quality and not only
-    classification confidence.
-    """
     intersection = (
         torch.minimum(predicted[:, 0], target[:, 0])
         + torch.minimum(predicted[:, 1], target[:, 1])
@@ -327,9 +228,6 @@ class TemporalMaxerContinuous(nn.Module):
         temporal_order_chunks: int = 3,
         classification_input_dim: int | None = None,
         trident_bins: int = 0,
-        neck_type: str = "maxpool",
-        attention_heads: int = 4,
-        attention_window: int = 19,
     ) -> None:
         super().__init__()
         if pyramid_levels < 1:
@@ -456,22 +354,6 @@ class TemporalMaxerContinuous(nn.Module):
             else None
         )
         self.regression_scales = nn.ModuleList(Scale() for _ in range(pyramid_levels))
-
-        if neck_type not in {"maxpool", "attention"}:
-            raise ValueError("neck_type must be 'maxpool' or 'attention'")
-        self.neck_type = neck_type
-        if neck_type == "attention":
-            self.classification_neck = nn.ModuleList(
-                LocalSelfAttentionBlock(hidden_dim, attention_heads, attention_window, dropout)
-                for _ in range(pyramid_levels)
-            )
-            self.regression_neck = nn.ModuleList(
-                LocalSelfAttentionBlock(hidden_dim, attention_heads, attention_window, dropout)
-                for _ in range(pyramid_levels)
-            )
-        else:
-            self.classification_neck = None
-            self.regression_neck = None
         self.temporal_order_permutations = tuple(
             itertools.permutations(range(self.temporal_order_chunks))
         )
@@ -497,20 +379,6 @@ class TemporalMaxerContinuous(nn.Module):
         features: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> dict[str, list[torch.Tensor]]:
-        """Run the detector over a batch of ROI timelines.
-
-        Args:
-            features: ``[B, T, input_dim]`` per-bin features.
-            mask: ``[B, T]`` boolean mask of valid bins; all-valid when None.
-
-        Returns:
-            Dictionary of per-level lists: ``classification_logits``, ``quality_logits``,
-            ``offsets``, ``masks``, and, when enabled, ``offset_distributions`` and the
-            start/end boundary logits.
-
-        Raises:
-            ValueError: if ``features`` does not match the configured input dimension.
-        """
         if features.ndim != 3 or features.shape[-1] != self.input_dim:
             raise ValueError(
                 f"Expected [B, T, {self.input_dim}] features, got {tuple(features.shape)}"
@@ -576,13 +444,6 @@ class TemporalMaxerContinuous(nn.Module):
                 )
                 regression_current = (
                     regression_current * current_mask.to(regression_current.dtype)
-                )
-            if self.neck_type == "attention":
-                classification_current = self.classification_neck[level](
-                    classification_current, current_mask
-                )
-                regression_current = self.regression_neck[level](
-                    regression_current, current_mask
                 )
             pyramid_features.append(classification_current)
             regression_pyramid_features.append(regression_current)
@@ -713,7 +574,6 @@ class TemporalMaxerContinuous(nn.Module):
 
     @staticmethod
     def level_points(length: int, stride: int, device: torch.device) -> torch.Tensor:
-        """Return the bin centres of one pyramid level, in grid units."""
         return (torch.arange(length, device=device, dtype=torch.float32) + 0.5) * stride
 
     @torch.no_grad()
@@ -723,21 +583,6 @@ class TemporalMaxerContinuous(nn.Module):
         gt_segments_grid: torch.Tensor,
         device: torch.device,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Assign ground-truth segments to points of every pyramid level.
-
-        A point is positive when it falls inside a segment whose extent belongs to the
-        regression range of its level; ties go to the shortest segment. This is what makes
-        each level specialise in a duration band instead of every level chasing every
-        action.
-
-        Args:
-            lengths: number of points at each pyramid level.
-            gt_segments_grid: ``[n, 2]`` ground-truth segments in grid units.
-            device: device the targets are built on.
-
-        Returns:
-            Per-level classification targets and ``[left, right]`` regression targets.
-        """
         class_targets: list[torch.Tensor] = []
         regression_targets: list[torch.Tensor] = []
         for level, length in enumerate(lengths):
@@ -780,20 +625,6 @@ class TemporalMaxerContinuous(nn.Module):
         device: torch.device,
         sigma: float,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Build gaussian start and end target maps for the boundary heads.
-
-        Args:
-            lengths: number of points at each pyramid level.
-            gt_segments_grid: ``[n, 2]`` ground-truth segments in grid units.
-            device: device the targets are built on.
-            sigma: width of the gaussian, in points of the level.
-
-        Returns:
-            Per-level start and end target maps in ``[0, 1]``.
-
-        Raises:
-            ValueError: if ``sigma`` is not positive.
-        """
         if sigma <= 0:
             raise ValueError("Boundary target sigma must be positive")
         start_targets = []
@@ -829,26 +660,6 @@ class TemporalMaxerContinuous(nn.Module):
         rank_sort: bool = False,
         rank_sort_delta: float = 0.5,
     ) -> dict[str, torch.Tensor]:
-        """Compute the training losses of one batch.
-
-        Args:
-            output: dictionary returned by :meth:`forward`.
-            gt_segments_seconds: per-sequence ground-truth segments, in seconds.
-            grid_stride_seconds: seconds covered by one bin of the finest level.
-            regression_weight: weight of the DIoU regression term.
-            quality_weight: weight of the quality head.
-            distribution_weight: weight of the distribution focal loss (DFL only).
-            empty_sequence_weight: weight of sequences with no annotated action, which
-                control how hard the model is pushed to stay silent on empty ROIs.
-            boundary_weight: weight of the boundary heads.
-            boundary_target_sigma: width of the gaussian boundary targets.
-            rank_sort: replace focal classification with Rank & Sort loss.
-            rank_sort_delta: smoothing of the Rank & Sort step function.
-
-        Returns:
-            Dictionary with the total ``loss``, each component, and the number of
-            positive points used for normalisation.
-        """
         class_logits = output["classification_logits"]
         offsets = output["offsets"]
         masks = output["masks"]
@@ -988,25 +799,6 @@ class TemporalMaxerContinuous(nn.Module):
         quality_power: float = 0.5,
         min_duration_seconds: float = 2.0,
     ) -> list[torch.Tensor]:
-        """Turn per-level predictions into scored temporal detections.
-
-        Scores combine classification confidence with the quality head, raised to
-        ``quality_power``; boundaries are decoded from the regression offsets and snapped
-        towards the boundary maps when refinement is enabled. NMS is left to the caller,
-        so the same decoding feeds both proposal-level and detection-level evaluation.
-
-        Args:
-            output: dictionary returned by :meth:`forward`.
-            grid_stride_seconds: seconds covered by one bin of the finest level.
-            durations_seconds: per-sequence duration, used to clamp the end boundary.
-            score_threshold: minimum score a point needs to produce a candidate.
-            pre_nms_topk: candidates kept per level and per sequence.
-            quality_power: exponent applied to the quality score before fusion.
-            min_duration_seconds: candidates shorter than this are dropped.
-
-        Returns:
-            One ``[n, 3]`` tensor of ``[t_start, t_end, score]`` per sequence.
-        """
         decoded: list[torch.Tensor] = []
         batch_size = output["classification_logits"][0].shape[0]
         for batch_index in range(batch_size):
@@ -1076,5 +868,4 @@ class TemporalMaxerContinuous(nn.Module):
 def class_logits_empty(
     output: dict[str, list[torch.Tensor]], batch_index: int
 ) -> torch.Tensor:
-    """Return an empty detection tensor with the dtype and device of the batch."""
     return output["classification_logits"][0].new_empty((0, 3))

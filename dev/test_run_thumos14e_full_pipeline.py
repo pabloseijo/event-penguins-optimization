@@ -1,10 +1,3 @@
-"""Tests for the end-to-end THUMOS14-E pipeline runner.
-
-Checks that canonical evaluation refuses a partial class set, that the shared
-cache rejects a foreign recording or a missing shard, that a fold split cannot
-absorb test videos, and that the quality screen uses the frozen source thresholds.
-"""
-
 from __future__ import annotations
 
 import unittest

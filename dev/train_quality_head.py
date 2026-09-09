@@ -41,6 +41,7 @@ from tqdm import tqdm
 
 from src.augmented_tsn import AugmentedTsn
 from src.classification import ProposalDataset
+from src.classification import collate_gpu, construir_imaxes_gpu  # noqa: E402
 from src.evaluation import DetectionsEvaluator, segment_iou
 from src.rank_sort_loss import rank_sort_loss
 from src.temporalmaxer_lite import temporal_aware_normalization_perturbation
@@ -132,6 +133,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train frozen-ATSN proposal quality head.")
     parser.add_argument("--data-path", default="data/preprocessed.h5")
     parser.add_argument("--ann-path", default="config/annotations/annotations.json")
+    parser.add_argument(
+        "--evaluation-sequences",
+        default=None,
+        help=(
+            "Ficheiro cunha gravación por liña co universo do split a avaliar. Sen el, o "
+            "universo derívase das gravacións que produciron propostas, e un vídeo sen ningunha "
+            "proposta desaparecería do ground truth en vez de contar como fallo (inflando mAP e "
+            "recall)."
+        ),
+    )
     parser.add_argument("--model-path", default="models/model.pk")
     parser.add_argument("--train-proposals", default=None)
     parser.add_argument("--val-proposals", required=True)
@@ -325,9 +336,32 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-train-proposals", type=int, default=None)
     parser.add_argument("--max-val-proposals", type=int, default=None)
+    # Sen isto ProposalDataset usa o seu cache_full_events=True por defecto e
+    # materializa a gravacion ENTEIRA por cada ROI (ata 1,47 G eventos = 23,5
+    # GB). O 2026-09-07 tres workers desta etapa ocupaban 7,4 + 8,6 + 10,9 GB e
+    # en 5 h non produciran un so byte. E o mesmo fallo que xa se corrixira en
+    # train_thumos14_ovr_atsn.py, onde levara a ETA de 3.146 h a viable, pero o
+    # camiño da quality head quedara sen tocar.
+    parser.add_argument("--timestamp-cache-dir", default=None)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
+
+
+def dims_roi(data_path, rec_name, roi_id):
+    """Alto e ancho do ROI, para construir as time surfaces en GPU."""
+    import h5py
+    with h5py.File(str(data_path), "r") as f:
+        g = f[str(rec_name)][str(roi_id)]
+        return int(g.attrs["height"]), int(g.attrs["width"])
+
+
+# Con representacion en GPU o lote leva eventos crus, non imaxes: hai que
+# acoutalo ou o DataLoader come GB. 4 propostas x 64 MB x prefetch 2 x 2
+# workers = 1 GB por cadea, fronte aos varios GB que provocaron o OOM.
+LOTE_MAX_GPU = 4
+WORKERS_MAX_GPU = 2
+PREFETCH_GPU = 2
 
 def resolve_path(path: str | Path) -> Path:
     path = Path(path)
@@ -437,20 +471,38 @@ def collect_or_load_representations(
         num_tsn_samples=expanded_tsn_samples(args.num_tsn_samples, args.augment_factor),
         sample_duration=args.sample_duration * 1e6,
         decay=args.decay,
+        cache_full_events=False,
+        timestamp_cache_dir=args.timestamp_cache_dir,
     )
+    en_gpu = device.type == "cuda"
+    dataset.gpu_representation = en_gpu
+    alto, ancho = (
+        dims_roi(resolve_path(args.data_path), proposals.iloc[0]["rec_name"],
+                 proposals.iloc[0]["roi_id"])
+        if en_gpu else (0, 0)
+    )
+    lote = min(args.repr_batch_size, LOTE_MAX_GPU) if en_gpu else args.repr_batch_size
+    obreiros = min(args.num_workers, WORKERS_MAX_GPU) if en_gpu else args.num_workers
     loader = DataLoader(
         dataset,
-        batch_size=args.repr_batch_size,
+        batch_size=lote,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        num_workers=obreiros,
+        pin_memory=torch.cuda.is_available() and not en_gpu,
+        collate_fn=collate_gpu if en_gpu else None,
+        **({"prefetch_factor": PREFETCH_GPU} if en_gpu and obreiros > 0 else {}),
     )
 
     all_embeddings = []
     all_logits = []
     progress = tqdm(loader, desc="repr", disable=args.quiet_progress)
-    for imgs, *_ in progress:
-        emb, logits = forward_embedding(model, imgs.to(device, non_blocking=True))
+    for lote in progress:
+        if en_gpu:
+            planas = construir_imaxes_gpu(lote[0], lote[1], args.decay, alto, ancho, device)
+            imgs = planas.view(-1, lote[2], *planas.shape[1:])
+        else:
+            imgs = lote[0].to(device, non_blocking=True)
+        emb, logits = forward_embedding(model, imgs)
         all_embeddings.append(emb.detach().cpu().numpy().astype(np.float16))
         all_logits.append(logits.detach().cpu().numpy().astype(np.float32))
 
@@ -550,6 +602,8 @@ def collect_or_load_context_logits(
             num_tsn_samples=expanded_tsn_samples(args.num_tsn_samples, args.augment_factor),
             sample_duration=args.sample_duration * 1e6,
             decay=args.decay,
+            cache_full_events=False,
+            timestamp_cache_dir=args.timestamp_cache_dir,
         )
         loader = DataLoader(
             dataset,
@@ -620,6 +674,8 @@ def collect_or_load_context_representations(
             num_tsn_samples=expanded_tsn_samples(args.num_tsn_samples, args.augment_factor),
             sample_duration=args.sample_duration * 1e6,
             decay=args.decay,
+            cache_full_events=False,
+            timestamp_cache_dir=args.timestamp_cache_dir,
         )
         loader = DataLoader(
             dataset,
@@ -692,17 +748,36 @@ def softmax_ed(logits: np.ndarray, temperature: float) -> np.ndarray:
     return exp[:, 1] / exp.sum(axis=1)
 
 
-def robust01(values: pd.Series | np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
+def robust01_bounds(
+    values: pd.Series | np.ndarray, lo: float = 1.0, hi: float = 99.0
+) -> tuple[float, float]:
+    """Percentís de recorte. Axústanse SÓ en train e persístense no checkpoint."""
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
+    finite = np.isfinite(arr)
+    if finite.sum() == 0:
+        return 0.0, 0.0
+    qlo, qhi = np.nanpercentile(arr[finite], [lo, hi])
+    return float(qlo), float(qhi)
+
+
+def robust01_apply(values: pd.Series | np.ndarray, qlo: float, qhi: float) -> np.ndarray:
     arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
     finite = np.isfinite(arr)
     out = np.zeros(len(arr), dtype=np.float64)
-    if finite.sum() == 0:
-        return out
-    qlo, qhi = np.nanpercentile(arr[finite], [lo, hi])
-    if qhi <= qlo + 1e-12:
+    if finite.sum() == 0 or qhi <= qlo + 1e-12:
         return out
     out[finite] = np.clip((arr[finite] - qlo) / (qhi - qlo), 0.0, 1.0)
     return out
+
+
+def robust01(values: pd.Series | np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
+    """Axuste e aplicación sobre o mesmo conxunto.
+
+    ATENCIÓN: usar isto sobre val/test é transdución — o valor dunha proposta pasaría a
+    depender das demais propostas do mesmo split, rompendo a inferencia vídeo a vídeo. Para
+    train/val/test usa `robust01_bounds` sobre train e `robust01_apply` no resto.
+    """
+    return robust01_apply(values, *robust01_bounds(values, lo, hi))
 
 
 def max_tiou_seconds(t_start_us: float, t_end_us: float, segments_s: np.ndarray) -> float:
@@ -875,10 +950,23 @@ def add_lattice_family_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_family_id"])
 
 
-def add_rank_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_rank_features(
+    df: pd.DataFrame, robust_bounds: dict | None = None
+) -> tuple[pd.DataFrame, dict]:
+    """Engade features de ranking.
+
+    `robust_bounds` son os percentís axustados en train. Se é None (modo train), axústanse aquí
+    e devólvense para persistilos no checkpoint e reutilizalos en val/test.
+    """
     df = df.copy()
-    df["proposal_score_robust"] = robust01(df["score"])
-    df["source_score_robust"] = robust01(df["source_score"] if "source_score" in df.columns else df["score"])
+    source_values = df["source_score"] if "source_score" in df.columns else df["score"]
+    if robust_bounds is None:
+        robust_bounds = {
+            "proposal_score": list(robust01_bounds(df["score"])),
+            "source_score": list(robust01_bounds(source_values)),
+        }
+    df["proposal_score_robust"] = robust01_apply(df["score"], *robust_bounds["proposal_score"])
+    df["source_score_robust"] = robust01_apply(source_values, *robust_bounds["source_score"])
     df["duration_s"] = (df["t_end"] - df["t_start"]) / 1e6
     df["duration_log"] = np.log1p(np.maximum(df["duration_s"], 0.0))
     excess = np.maximum(0.0, df["duration_s"].to_numpy(dtype=np.float64) - 60.0)
@@ -922,7 +1010,11 @@ def add_rank_features(df: pd.DataFrame) -> pd.DataFrame:
             if std > 1e-12:
                 z = (vals - vals.mean()) / std
                 df.loc[idx, dst] = 1.0 / (1.0 + np.exp(-z))
-    return df
+    # Devolvense tamen os percentis: se entraron como None axustaronse aqui
+    # (modo train) e o chamador ten que persistilos no checkpoint para
+    # reutilizalos en val/test. Sen eles, val e test reaxustarianse cos seus
+    # propios datos, que e unha fuga.
+    return df, robust_bounds
 
 
 def prepare_frame(
@@ -932,7 +1024,9 @@ def prepare_frame(
     ann_path: Path,
     args: argparse.Namespace,
     context_logits: dict[str, np.ndarray] | None = None,
+    robust_bounds: dict | None = None,
 ) -> pd.DataFrame:
+    """`robust_bounds`: percentís axustados en train. None só en modo train."""
     df = proposals.reset_index(drop=True).copy()
     df["logit_bg"] = logits[:, 0].astype(np.float64)
     df["logit_ed"] = logits[:, 1].astype(np.float64)
@@ -955,7 +1049,10 @@ def prepare_frame(
         df["context_cnn_contrast"] = df["cnn_score"] - df["context_max_cnn_score"]
         df["context_cnn_symmetry"] = np.abs(adjacent_scores[:, 0] - adjacent_scores[:, 1])
         df["context_margin_contrast"] = df["cnn_margin"] - adjacent_margins.max(axis=1)
-    df = add_rank_features(df)
+    df, fitted_robust_bounds = add_rank_features(df, robust_bounds)
+    # Publícanse en `attrs` para que quen adestra os poida gardar no checkpoint sen cambiar a
+    # sinatura de retorno (e sen que os chamadores que non os precisan teñan que tocarse).
+    df.attrs["robust_bounds"] = fitted_robust_bounds
 
     ann_index, split_recs = build_annotation_index(ann_path, split, args.min_gt_duration)
     rows = []
@@ -1025,7 +1122,10 @@ def prepare_frame(
             }
         )
         rows.append(labeled)
-    return pd.DataFrame(rows).reset_index(drop=True)
+    result = pd.DataFrame(rows).reset_index(drop=True)
+    # `pd.DataFrame(rows)` crea un obxecto novo, así que hai que repoñer os attrs a man.
+    result.attrs["robust_bounds"] = fitted_robust_bounds
+    return result
 
 
 def numeric_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -2051,6 +2151,9 @@ def train_config(
         "embedding_dim": int(embedding_dim),
         "numeric_dim": int(numeric_dim),
         "scaler": scaler,
+        # Percentís de recorte axustados en train; aplícanse tal cal en val/test para non
+        # facer transdución. Sen isto, o score dunha proposta dependería das do seu split.
+        "robust_bounds": train_df.attrs.get("robust_bounds"),
         "args": vars(args),
         "recording_groups": recording_names,
         "group_dro_weights": group_weights.detach().cpu().tolist() if args.group_dro else None,
@@ -2255,7 +2358,26 @@ def evaluate_score(
     suffix: str,
 ) -> list[dict]:
     ann_path = resolve_path(args.ann_path)
-    valid_sequences = sorted(df["rec_name"].unique())
+    # O universo de avaliación é o do SPLIT, non o das gravacións que produciron propostas: un
+    # vídeo sen ningunha proposta ten que contar como fallo, non desaparecer do ground truth.
+    # Derivalo das propostas encollería o denominador do recall e inflaría mAP e recall.
+    with_proposals = sorted(df["rec_name"].unique())
+    if args.evaluation_sequences:
+        valid_sequences = sorted(
+            line.strip()
+            for line in resolve_path(args.evaluation_sequences)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        missing = sorted(set(valid_sequences) - set(with_proposals))
+        if missing:
+            print(
+                f"[AVISO] {len(missing)} gravacións do split non produciron ningunha proposta e "
+                f"cóntanse como fallos: {missing[:5]}{' ...' if len(missing) > 5 else ''}"
+            )
+    else:
+        valid_sequences = with_proposals
     gt = load_gt(valid_sequences, ann_path, args.min_gt_duration)
     rows = []
     for min_score in args.min_score:
@@ -2273,17 +2395,21 @@ def evaluate_score(
         mean_ap = evaluator.run()
         pred_df = predictions_to_df(prediction, args.min_gt_duration)
         best_iou = best_iou_by_gt(gt, pred_df)
+        row = {
+            "variant": label,
+            "score_col": score_col,
+            "min_score": float(min_score),
+            "n_pred": int(len(pred_df)),
+            "mAP": float(mean_ap),
+        }
+        # As columnas de AP nomeanse a partir dos limiares realmente usados (--tiou), non
+        # hardcodeadas: o pipeline de THUMOS pasa 0.3..0.7 e o nome fixo "AP@0.1" contiña
+        # en realidade o AP@0.3, desprazando toda a serie.
+        for threshold, value in zip(args.tiou, evaluator.mAP):
+            row[f"AP@{threshold:g}"] = float(value)
         rows.append(
             {
-                "variant": label,
-                "score_col": score_col,
-                "min_score": float(min_score),
-                "n_pred": int(len(pred_df)),
-                "mAP": float(mean_ap),
-                "AP@0.1": float(evaluator.mAP[0]),
-                "AP@0.3": float(evaluator.mAP[1]),
-                "AP@0.5": float(evaluator.mAP[2]),
-                "AP@0.7": float(evaluator.mAP[3]),
+                **row,
                 "recall@0.1": float((best_iou >= 0.1).mean()) if len(best_iou) else float("nan"),
                 "recall@0.3": float((best_iou >= 0.3).mean()) if len(best_iou) else float("nan"),
                 "recall@0.5": float((best_iou >= 0.5).mean()) if len(best_iou) else float("nan"),
@@ -2329,6 +2455,70 @@ def evaluate_all_scores(
     for col in cols:
         rows.extend(evaluate_score(df, col, label, args, pred_dir, suffix=f"epoch{epoch}"))
     return rows
+
+
+def tious_contra_anotacions(df: pd.DataFrame, ann_path: Path, split: str) -> np.ndarray:
+    """Mellor tIoU de cada proposta contra as anotacions do seu ROI.
+
+    So xeometria: non toca eventos nin o modelo, asi que e barato (segundos para
+    3 M de filas) fronte as horas que custa extraer as representacions.
+    """
+    ann_index, _ = build_annotation_index(ann_path, split, 0.0)
+    out = np.zeros(len(df), dtype=np.float64)
+    recs = df["rec_name"].to_numpy()
+    rois = df["roi_id"].to_numpy()
+    t0 = df["t_start"].to_numpy(dtype=np.float64)
+    t1 = df["t_end"].to_numpy(dtype=np.float64)
+    for (rec, roi), idx in df.groupby(["rec_name", "roi_id"]).indices.items():
+        segs = ann_index.get(rec, {}).get(roi_to_ann_key(roi), {}).get("ed", np.empty((0, 2)))
+        if len(segs) == 0:
+            continue
+        ini = t0[idx] / 1e6
+        fin = t1[idx] / 1e6
+        gi = segs[:, 0][None, :]
+        gf = segs[:, 1][None, :]
+        inter = np.maximum(0.0, np.minimum(fin[:, None], gf) - np.maximum(ini[:, None], gi))
+        union = (fin[:, None] - ini[:, None]) + (gf - gi) - inter
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = np.where(union > 0, inter / union, 0.0)
+        out[idx] = t.max(axis=1)
+    return out
+
+
+def limit_frame_estratificado(
+    df: pd.DataFrame, max_rows: int | None, seed: int, ann_path: Path, split: str, semi_tiou: float
+) -> pd.DataFrame:
+    """Recorta o lattice CONSERVANDO todos os positivos e semi-positivos.
+
+    Por que non vale limit_frame a secas: mediuse o 2026-09-08 sobre o fold 0 de
+    BaseballPitch que o lattice de train ten 3.005.452 propostas e SO 240
+    positivos con tIoU>=0.5 (0,008 %, ou 1 entre 12.500). Unha mostraxe uniforme
+    a 50.000 conserva o 1,66 % de todo, asi que deixaba 5 positivos dos 240, e o
+    recall@0.5 medido (0,125) era exactamente ese teito. Recortar por score e
+    aínda peor: deixa CERO, porque o score da etapa 1 non correlaciona.
+
+    Usar as etiquetas para escoller o conxunto de ADESTRAMENTO e lexitimo e
+    estandar (é mineria de negativos). NON se pode facer no de validacion nin no
+    de test, e por iso esta funcion so se aplica a train.
+    """
+    if max_rows is None or len(df) <= max_rows:
+        return df.reset_index(drop=True)
+    t = tious_contra_anotacions(df, ann_path, split)
+    manter = t >= semi_tiou
+    n_manter = int(manter.sum())
+    if n_manter >= max_rows:
+        idx = np.nonzero(manter)[0]
+        escolla = pd.Series(idx).sample(n=max_rows, random_state=seed).to_numpy()
+    else:
+        resto = np.nonzero(~manter)[0]
+        n_extra = min(max_rows - n_manter, len(resto))
+        extra = pd.Series(resto).sample(n=n_extra, random_state=seed).to_numpy()
+        escolla = np.concatenate([np.nonzero(manter)[0], extra])
+    escolla.sort()
+    print(f"[INFO] Recorte estratificado: {len(escolla):,} de {len(df):,} propostas · "
+          f"{n_manter:,} con tIoU>={semi_tiou} conservadas enteiras "
+          f"({int((t >= 0.5).sum()):,} con tIoU>=0.5)")
+    return df.iloc[escolla].reset_index(drop=True)
 
 
 def limit_frame(df: pd.DataFrame, max_rows: int | None, seed: int) -> pd.DataFrame:
@@ -2407,7 +2597,24 @@ def main() -> None:
             val_props, val_context_dir, args, device
         )
         val_embeddings = combine_context_embeddings(val_embeddings, val_context_embeddings, args)
-        val_df = prepare_frame(val_props, val_logits, val_split, ann_path, args, val_context_logits)
+        # Os percentís de recorte veñen do checkpoint (axustados en train). Os checkpoints
+        # anteriores a este cambio non os teñen: nese caso axústanse sobre o propio split, que é
+        # o comportamento vello, e avísase para que non pase desapercibido.
+        eval_robust_bounds = checkpoint.get("robust_bounds")
+        if eval_robust_bounds is None:
+            print(
+                "[AVISO] O checkpoint non trae 'robust_bounds' (é anterior ao arranxo de "
+                "transdución). Os percentís de recorte axustaranse sobre o split avaliado."
+            )
+        val_df = prepare_frame(
+            val_props,
+            val_logits,
+            val_split,
+            ann_path,
+            args,
+            val_context_logits,
+            robust_bounds=eval_robust_bounds,
+        )
         val_df.to_csv(cache_dir / f"{args.eval_label}_quality_labels.csv", index=False)
         print_summary(args.eval_label, val_df)
 
@@ -2453,7 +2660,10 @@ def main() -> None:
         raise ValueError("--train-proposals is required unless --eval-checkpoint is used")
 
     train_props = pd.read_csv(resolve_path(args.train_proposals)).reset_index(drop=True)
-    train_props = limit_frame(train_props, args.max_train_proposals, args.seed)
+    train_props = limit_frame_estratificado(
+        train_props, args.max_train_proposals, args.seed, ann_path,
+        split_from_proposals(train_props, ann_path), args.semi_tiou
+    )
     train_split = split_from_proposals(train_props, ann_path)
     print(f"[INFO] Train proposals={len(train_props)} split={train_split}; val proposals={len(val_props)} split={val_split}")
 
@@ -2505,6 +2715,8 @@ def main() -> None:
             args,
             train_context_logits,
         )
+        # Os percentís de recorte axústanse SÓ en train e reutilízanse en val: calculalos sobre
+        # val faría que o score dunha proposta dependese das demais propostas do mesmo split.
         val_df = prepare_frame(
             val_props,
             val_logits,
@@ -2512,6 +2724,7 @@ def main() -> None:
             ann_path,
             args,
             val_context_logits,
+            robust_bounds=train_df.attrs.get("robust_bounds"),
         )
         train_df.to_csv(train_labels_path, index=False)
         val_df.to_csv(val_labels_path, index=False)

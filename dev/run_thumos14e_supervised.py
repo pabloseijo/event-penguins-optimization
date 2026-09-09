@@ -96,7 +96,14 @@ CONVERSION_ROLES = {
     "primary_fixed_interpolated": "fixed_interpolated",
     "sensitivity_adaptive_interpolated": "adaptive_interpolated",
     "sensitivity_original_rate": "original_rate_ablation",
+    # Gravacion real cun DVXplorer (espello de UIBK), non simulada con v2e.
+    # Nunha captura de hardware non existen dvs_profile nin
+    # timestamp_resolution_s: non se simulou ningun sensor. Declarar eses
+    # campos aqui seria falsificar a traza de procedencia, asi que este rol
+    # comproba en troques as propiedades da captura.
+    "real_dvxplorer": "hardware_capture",
 }
+HARDWARE_ROLES = frozenset({"real_dvxplorer"})
 
 NATIVE_MODEL_TOPOLOGY = {
     "retag": {
@@ -234,14 +241,31 @@ def validate_assembled_corpus(
             f"Conversion role {conversion_role} requires timing={expected_timing}; "
             f"got {recipe.get('timing')}"
         )
-    if recipe.get("dvs_profile") != "clean":
-        raise ValueError("The locked comparison requires the official v2e clean profile")
-    if expected_timing == "fixed_interpolated":
+    if conversion_role in HARDWARE_ROLES:
+        # Captura real: comprobase a xeometria e que non se tocou o fluxo.
+        if recipe.get("capture") != "hardware":
+            raise ValueError(f"Role {conversion_role} requires recipe.capture == 'hardware'")
+        if list(recipe.get("sensor_resolution", [])) != [640, 480]:
+            raise ValueError("The DVXplorer capture must declare sensor_resolution [640, 480]")
         if (
-            recipe.get("timestamp_resolution_s") != 0.003
-            or recipe.get("disable_slomo") is not False
+            int(recipe.get("output_width", -1)) != 346
+            or int(recipe.get("output_height", -1)) != 260
         ):
-            raise ValueError("The primary conversion must use SuperSloMo at fixed 3 ms")
+            raise ValueError("The rescaled capture must be 346x260, as the frozen encoder expects")
+        if recipe.get("deduplicacion") is not None:
+            raise ValueError(
+                "The locked comparison requires the untouched event stream: "
+                "per-bin deduplication distorts the event-rate actionness signal"
+            )
+    else:
+        if recipe.get("dvs_profile") != "clean":
+            raise ValueError("The locked comparison requires the official v2e clean profile")
+        if expected_timing == "fixed_interpolated":
+            if (
+                recipe.get("timestamp_resolution_s") != 0.003
+                or recipe.get("disable_slomo") is not False
+            ):
+                raise ValueError("The primary conversion must use SuperSloMo at fixed 3 ms")
 
     summary = validation.get("class_summary", {}).get("instances_by_split_and_class", {})
     for split in ("train", "val", "test"):
@@ -254,7 +278,8 @@ def validate_assembled_corpus(
         "conversion_protocol_id": protocol_id,
         "conversion_role": conversion_role,
         "timing": expected_timing,
-        "dvs_profile": recipe["dvs_profile"],
+        "dvs_profile": recipe.get("dvs_profile"),
+        "capture": recipe.get("capture", "simulated"),
         "validated_recordings": len(validation_ids),
     }
 
@@ -575,6 +600,13 @@ def train_heads(args: argparse.Namespace) -> None:
                 str(args.num_workers),
                 "--device",
                 args.device,
+                # Sen isto, o extractor usa out_dir/timestamp_cache, un
+                # directorio por etapa e por split que empeza baleiro: cada un
+                # reconstruiria os timestamps das 413 gravacions. A cache
+                # compartida do corpus xa existe e son 171 GB; reutilizala e
+                # obrigatorio, non unha optimizacion.
+                "--timestamp-cache-dir",
+                str(out_root / "shared_features" / "continuous" / "timestamp_cache"),
             ]
             run_logged(command, feature_dir / "extract.log")
         annotation_path = (

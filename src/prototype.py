@@ -1,11 +1,3 @@
-"""Spatial prototype of the Ecstatic Display and its per-bin similarity score.
-
-The prototype is the mean normalised event-density grid over annotated ED
-instances of the training split. Scoring a recording against it answers a
-question the raw event rate cannot: not *how much* motion there is, but whether
-it is laid out over the nest the way an ED is.
-"""
-
 from __future__ import annotations
 
 import json
@@ -34,6 +26,26 @@ def _events_to_grid(
     return grid / max_val if max_val > 0 else grid
 
 
+def _limite_binario(dataset, obxectivo: float, dereita: bool) -> int:
+    """Indice do primeiro evento con t >= obxectivo (ou t > obxectivo se dereita).
+
+    Equivale a np.searchsorted sobre a columna de timestamps, pero sen
+    materializala: fai ~log2(N) lecturas dun so elemento sobre o dataset HDF5.
+    Require que os timestamps sexan non decrecentes, cousa que a etapa validate
+    do pipeline comproba en todo o corpus.
+    """
+    baixo, alto = 0, len(dataset)
+    while baixo < alto:
+        medio = (baixo + alto) // 2
+        valor = float(dataset[medio, 2])
+        se_avanza = valor <= obxectivo if dereita else valor < obxectivo
+        if se_avanza:
+            baixo = medio + 1
+        else:
+            alto = medio
+    return baixo
+
+
 def build_ed_prototype(
     data_path: str,
     ann_path: str,
@@ -44,22 +56,6 @@ def build_ed_prototype(
     min_duration: float = 2.0,
     recordings: set[str] | None = None,
 ) -> np.ndarray:
-    """Average the event-density grids of every annotated ED instance.
-
-    Args:
-        data_path: HDF5 file produced by ``scripts/preprocess.py``.
-        ann_path: ActivityNet-style annotation file.
-        split: split whose recordings feed the prototype when ``recordings`` is None.
-        label: annotation label to average over.
-        grid_h: prototype height in cells.
-        grid_w: prototype width in cells.
-        min_duration: instances shorter than this (seconds) are skipped.
-        recordings: explicit recording set, overriding ``split``. Pass the training
-            fold here when cross-validating, so no test recording leaks in.
-
-    Returns:
-        L2-normalised ``[grid_h, grid_w]`` prototype, or zeros when no instance matched.
-    """
     with open(ann_path) as f:
         ann = json.load(f)
 
@@ -101,13 +97,26 @@ def build_ed_prototype(
 
                 roi_height = int(hf[rec][roi_id].attrs["height"])
                 roi_width = int(hf[rec][roi_id].attrs["width"])
-                all_events = np.array(hf[rec][roi_id]["events"])
+                dataset = hf[rec][roi_id]["events"]
 
                 for a in matching_annotations:
                     t_start, t_end = a["segment"]
 
-                    mask = (all_events[:, 2] >= t_start * 1e6) & (all_events[:, 2] <= t_end * 1e6)
-                    events = all_events[mask]
+                    # Antes cargabase a gravacion enteira con np.array() e
+                    # aplicabase unha mascara booleana para quedar cuns poucos
+                    # segundos. No corpus real hai gravacions de 1.467.653.571
+                    # eventos: 23,5 GB para extraer uns megas, e o 2026-09-06
+                    # iso levou build_prototypes a 25,8 GB e a maquina a swap.
+                    #
+                    # Os timestamps son non decrecentes (validate compróbao en
+                    # todo o corpus), asi que a mascara selecciona un tramo
+                    # CONTIGUO. Localizase por busca binaria sobre o dataset:
+                    # ~31 lecturas dun elemento en vez de 1.470 millons. Os
+                    # limites son os mesmos que daba a mascara: inicio no
+                    # primeiro t >= t_start, fin despois do ultimo t <= t_end.
+                    ini = _limite_binario(dataset, t_start * 1e6, dereita=False)
+                    fin = _limite_binario(dataset, t_end * 1e6, dereita=True)
+                    events = np.asarray(dataset[ini:fin])
 
                     if len(events) < 10:
                         n_skipped += 1
@@ -134,46 +143,57 @@ def get_prototype_score(
     roi_width: int,
     min_events_per_bin: int = 5,
 ) -> np.ndarray:
-    """Per-bin cosine similarity between the event layout and the ED prototype.
+    """Similitude coseno por bin co prototipo ED.
 
-    Bins holding fewer than ``min_events_per_bin`` events score 0: there is not
-    enough evidence to judge their spatial layout. Since the prototype is
-    L2-normalised, the cosine similarity is a plain dot product.
-
-    Args:
-        events: ``[n, 4]`` array of ``[x, y, t, p]``.
-        bins: bin edges from :func:`src.proposals.get_event_rate`.
-        prototype: grid from :func:`build_ed_prototype`.
-        roi_height: ROI height in pixels.
-        roi_width: ROI width in pixels.
-        min_events_per_bin: evidence required to score a bin.
-
-    Returns:
-        Per-bin similarity in ``[0, 1]``.
+    Bins con menos de min_events_per_bin eventos reciben 0 (datos insuficientes).
+    Como o prototipo está normalizado L2, a similitude coseno é o produto escalar.
     """
     grid_h, grid_w = prototype.shape
     bin_num = len(bins) - 1
 
-    bin_idx = np.searchsorted(bins[1:], events[:, 2], side="right")
-    bin_idx = np.clip(bin_idx, 0, bin_num - 1)
-
-    gy = np.clip((events[:, 1] / roi_height * grid_h).astype(int), 0, grid_h - 1)
-    gx = np.clip((events[:, 0] / roi_width * grid_w).astype(int), 0, grid_w - 1)
-
-    flat_idx = gy * grid_w + gx
     n_cells = grid_h * grid_w
     proto_flat = prototype.ravel()
 
-    counts_per_bin = np.bincount(bin_idx, minlength=bin_num)
-    scores = np.zeros(bin_num, dtype=np.float64)
-    active_bins = np.where(counts_per_bin >= min_events_per_bin)[0]
+    # Acumulacion por bloques. Cada temporal intermedio (bin_idx, gy, gx,
+    # flat_idx) e do tamano dos eventos: con 493 M son ~35 GB, e o OOM killer
+    # mataba o proceso nas gravacions grandes de THUMOS14-E. Aqui os temporais
+    # limitanse ao bloque. Resultado identico.
+    CHUNK = 25_000_000
+    n = len(events)
+    grid = np.zeros((bin_num, n_cells), dtype=np.float64)
+    counts_per_bin = np.zeros(bin_num, dtype=np.int64)
 
-    for b in active_bins:
-        mask = bin_idx == b
-        grid_flat = np.bincount(flat_idx[mask], minlength=n_cells).astype(np.float64)
-        norm = np.linalg.norm(grid_flat)
-        if norm > 0:
-            grid_flat /= norm
-            scores[b] = np.clip(np.dot(grid_flat, proto_flat), 0.0, 1.0)
+    for ini in range(0, n, CHUNK):
+        sl = slice(ini, min(ini + CHUNK, n))
+        # O bloque lese UNHA vez. Antes facianse tres slices por columna
+        # (events[sl, 2], [sl, 1], [sl, 0]); cando `events` e un dataset HDF5
+        # sen ler, cada slice descomprime os mesmos chunks outra vez. A
+        # aritmetica non cambia: as columnas saense do bloque xa lido.
+        blq = np.asarray(events[sl])
+        bi = np.searchsorted(bins[1:], blq[:, 2], side="right")
+        np.clip(bi, 0, bin_num - 1, out=bi)
+        gy = np.clip((blq[:, 1] / roi_height * grid_h).astype(np.int64), 0, grid_h - 1)
+        gx = np.clip((blq[:, 0] / roi_width * grid_w).astype(np.int64), 0, grid_w - 1)
+        comb = bi * n_cells + gy * grid_w + gx
+        grid += np.bincount(comb, minlength=bin_num * n_cells).reshape(bin_num, n_cells)
+        counts_per_bin += np.bincount(bi, minlength=bin_num)
+        del blq, bi, gy, gx, comb
+
+    scores = np.zeros(bin_num, dtype=np.float64)
+    normas = np.linalg.norm(grid, axis=1)
+    validos = (counts_per_bin >= min_events_per_bin) & (normas > 0)
+    scores[validos] = np.clip((grid[validos] @ proto_flat) / normas[validos], 0.0, 1.0)
+
+    return scores
+    combinado = bin_idx.astype(np.int64) * n_cells + flat_idx
+    grid = np.bincount(combinado, minlength=bin_num * n_cells).astype(np.float64)
+    grid = grid.reshape(bin_num, n_cells)
+    normas = np.linalg.norm(grid, axis=1)
+    validos = np.zeros(bin_num, dtype=bool)
+    validos[active_bins] = True
+    validos &= normas > 0
+    scores[validos] = np.clip(
+        (grid[validos] @ proto_flat) / normas[validos], 0.0, 1.0
+    )
 
     return scores

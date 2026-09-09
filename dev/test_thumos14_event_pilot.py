@@ -1,10 +1,3 @@
-"""Tests for the pilot conversion of THUMOS14 to events with v2e.
-
-Checks that the v2e command selects exactly one timing protocol, that official
-class annotations parse correctly, that copying events changes only the column
-order, and that the assembled index handles variable durations.
-"""
-
 from __future__ import annotations
 
 import csv

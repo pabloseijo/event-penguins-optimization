@@ -34,9 +34,29 @@ if str(ROOT) not in sys.path:
 
 from dev.prepare_thumos14_event_pilot import sha256_file  # noqa: E402
 from src.augmented_tsn import AugmentedTsn  # noqa: E402
-from src.classification import ProposalDataset  # noqa: E402
+from src.classification import (  # noqa: E402
+    ProposalDataset,
+    collate_gpu,
+    construir_imaxes_gpu,
+)
 from src.utils import temporal_nms  # noqa: E402
 
+
+
+def dims_roi(data_path, rec_name, roi_id):
+    """Alto e ancho do ROI, para construir as time surfaces en GPU."""
+    import h5py
+    with h5py.File(str(data_path), "r") as f:
+        g = f[str(rec_name)][str(roi_id)]
+        return int(g.attrs["height"]), int(g.attrs["width"])
+
+
+# Con representacion en GPU o lote leva eventos crus, non imaxes: hai que
+# acoutalo ou o DataLoader come GB. 4 propostas x 64 MB x prefetch 2 x 2
+# workers = 1 GB por cadea, fronte aos varios GB que provocaron o OOM.
+LOTE_MAX_GPU = 4
+WORKERS_MAX_GPU = 2
+PREFETCH_GPU = 2
 
 def resolve(path: str | Path) -> Path:
     value = Path(path).expanduser()
@@ -57,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     extract.add_argument("--source-model", type=Path, required=True)
     extract.add_argument("--out-dir", type=Path, required=True)
     extract.add_argument("--num-tsn-samples", type=int, default=7)
-    extract.add_argument("--augment-factor", type=int, default=3)
+    extract.add_argument("--augment-factor", type=int, default=1)
     extract.add_argument("--sample-duration", type=float, default=1.0)
     extract.add_argument("--decay", type=float, default=5e-6)
     extract.add_argument("--batch-size", type=int, default=64)
@@ -250,6 +270,16 @@ def extract(args: argparse.Namespace) -> None:
         num_tsn_samples=int(metadata["expanded_samples"]),
         sample_duration=args.sample_duration * 1e6,
         decay=args.decay,
+        # 2026-09-06: era True, e iso fai que _get_roi_data materialice a
+        # gravacion ENTEIRA cada vez que cambia de ROI. No corpus real hai
+        # gravacions de 1.467.653.571 eventos: 23,5 GB por lectura. Medido con
+        # True: 140 de 7003 batches en 8 h 37, a 1650 s/it, cun ETA de 3.146
+        # horas. Con False leense so as fiestras que fan falla, e os
+        # timestamps saen da cache compartida.
+        #
+        # Non cambia resultados: __getitem__ fai np.asarray(roi_events[s:e]) nos
+        # dous casos: con True eso e unha vista dun array xa cargado, con False
+        # unha lectura desa mesma franxa do dataset. Os valores son os mesmos.
         cache_full_events=False,
         timestamp_cache_dir=(
             str(resolve(args.timestamp_cache_dir))
@@ -257,18 +287,36 @@ def extract(args: argparse.Namespace) -> None:
             else str(out_dir / "timestamp_cache")
         ),
     )
+    # As imaxes constrúense en GPU: os workers so len eventos. Sen isto, o
+    # 98 % do tempo iase en create_time_map en NumPy e as GPUs quedaban ao 0 %.
+    en_gpu = device.type == "cuda"
+    dataset.gpu_representation = en_gpu
+    alto, ancho = (
+        dims_roi(args.data_path, proposals.iloc[0]["rec_name"], proposals.iloc[0]["roi_id"])
+        if en_gpu else (0, 0)
+    )
+    lote = min(args.batch_size, LOTE_MAX_GPU) if en_gpu else args.batch_size
+    obreiros = min(args.num_workers, WORKERS_MAX_GPU) if en_gpu else args.num_workers
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=lote,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
+        num_workers=obreiros,
+        pin_memory=device.type == "cuda" and not en_gpu,
+        persistent_workers=obreiros > 0,
+        collate_fn=collate_gpu if en_gpu else None,
+        **({"prefetch_factor": PREFETCH_GPU} if en_gpu and obreiros > 0 else {}),
     )
     cursor = completed
     with torch.inference_mode():
         for batch in tqdm(loader, desc="frozen ATSN features"):
-            images = batch[0].to(device, non_blocking=True)
+            if en_gpu:
+                planas = construir_imaxes_gpu(
+                    batch[0], batch[1], dataset.decay, alto, ancho, device
+                )
+                images = planas.view(-1, batch[2], *planas.shape[1:])
+            else:
+                images = batch[0].to(device, non_blocking=True)
             frame_features = model.encode_frames(images)
             values = consensus_features(model, frame_features).cpu().numpy()
             feature_array[cursor : cursor + len(values)] = values

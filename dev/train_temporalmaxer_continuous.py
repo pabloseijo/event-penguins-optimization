@@ -691,7 +691,12 @@ class ContinuousSequenceDataset(Dataset):
         auxiliary = self._get_auxiliary_features()
         if auxiliary is not None:
             auxiliary_values = np.asarray(auxiliary[start:end], dtype=np.float32).copy()
-            auxiliary_values = (auxiliary_values - self.auxiliary_mean) / self.auxiliary_std
+            # Protéxese o denominador coma no resto de normalizacións deste ficheiro. A caché de
+            # event-stats xa forza std>=1e-6, pero unha canle constante nun corpus futuro daría
+            # inf/NaN silencioso que se propagaría ao modelo.
+            auxiliary_values = (auxiliary_values - self.auxiliary_mean) / np.maximum(
+                self.auxiliary_std, 1e-6
+            )
             features = np.concatenate((features, auxiliary_values), axis=1)
         return features
 

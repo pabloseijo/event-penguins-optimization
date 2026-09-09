@@ -1,9 +1,3 @@
-"""Tests for the Rank & Sort loss.
-
-Checks that a correct ordering scores below a reversed one and that a batch
-without positives returns a differentiable zero rather than a NaN.
-"""
-
 from __future__ import annotations
 
 import unittest

@@ -1,5 +1,3 @@
-"""Filesystem and config guards used by the entry-point scripts."""
-
 import os
 import logging
 
@@ -7,31 +5,40 @@ logger = logging.getLogger(__name__)
 
 
 def check_key_and_bool(config: dict, key: str) -> bool:
-    """Return True when ``key`` is present in ``config`` and holds a truthy value.
+    """Return True only if *key* exists in *config* and its value is truthy.
 
-    Used to read the opt-in flags of the pipeline without forcing every config
-    file to list every switch.
+    Args:
+        config: Configuration dictionary.
+        key: Key to check.
     """
     return key in config and bool(config[key])
 
 
 def check_file_exists(filename: str) -> bool:
-    """Return whether ``filename`` exists, logging a warning when it does not."""
-    logger.debug(f"Comprobando {filename}")
+    """Return True if *filename* exists on disk; log a warning otherwise.
+
+    Args:
+        filename: Path to check.
+    """
+    logger.debug(f"Check {filename}")
     exists = os.path.exists(filename)
     if not exists:
-        logger.warning(f"{filename} non existe!")
+        logger.warning(f"{filename} does not exist!")
     return exists
 
 
 def uniquify_dir(path: str) -> str:
-    """Append a numeric suffix to ``path`` until it names a free location.
+    """Append a counter suffix to *path* until it does not exist on disk.
 
-    Runs never overwrite each other's outputs, which is what lets a result
-    directory be trusted months later.
+    Args:
+        path: Desired directory path.
+
+    Returns:
+        A path that does not yet exist: either *path* unchanged, or
+        *path*-1, *path*-2, … (extension preserved if any).
     """
     base, ext = os.path.splitext(path)
-    counter   = 1
+    counter = 1
     while os.path.exists(path):
         path = f"{base}-{counter}{ext}"
         counter += 1

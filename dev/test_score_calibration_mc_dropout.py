@@ -1,10 +1,3 @@
-"""Tests for the MC-dropout score calibration diagnostics.
-
-Checks that perfect calibration gives zero ECE, that overconfident errors raise
-the NLL, that extreme scores are clipped, and that the best-scoring match claims
-the ground-truth instance.
-"""
-
 import unittest
 
 import numpy as np

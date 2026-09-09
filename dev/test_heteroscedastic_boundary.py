@@ -1,11 +1,3 @@
-"""Tests for the heteroscedastic boundary model and its diagnostics.
-
-Checks that the candidate descriptor separates start from end roles, that jitter
-respects the sequence bounds and the minimum duration, that the model returns
-bounded means with finite uncertainty, and that the loss backpropagates through
-every output.
-"""
-
 from __future__ import annotations
 
 import argparse

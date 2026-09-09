@@ -1,9 +1,3 @@
-"""Tests for the profiling helpers of the THUMOS14 event conversion.
-
-Checks that the action window is centred and clamped to the video bounds and that
-the selection key is stable and class-specific.
-"""
-
 from __future__ import annotations
 
 import unittest

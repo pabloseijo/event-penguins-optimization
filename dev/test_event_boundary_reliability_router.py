@@ -1,9 +1,3 @@
-"""Tests for the boundary-reliability router between two prediction sets.
-
-Checks the routing directions, that merging swaps only the selected recordings,
-and that the safeguards demand no degradation plus at least one gain.
-"""
-
 from __future__ import annotations
 
 import unittest

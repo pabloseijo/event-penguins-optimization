@@ -85,10 +85,17 @@ def load_roi_bounds(data_path: Path) -> dict[tuple[str, str], tuple[float, float
     with h5py.File(data_path, "r") as hf:
         for rec in hf.keys():
             for roi in hf[rec].keys():
-                events = np.asarray(hf[rec][roi]["events"])
-                if len(events) == 0:
+                # Só fan falla o primeiro e o último timestamp. Antes facíase
+                # np.asarray() da gravación ENTEIRA para ler eses dous números:
+                # no corpus real iso son ata 23,5 GB por gravación, e o bucle
+                # percorre as 413, é dicir, 266 GB para extraer 826 valores.
+                # Con doce clases facéndoo á vez, o OOM killer mataba a etapa
+                # (Command failed -9). Léense os dous elementos do dataset, que
+                # dá exactamente os mesmos valores.
+                dataset = hf[rec][roi]["events"]
+                if dataset.shape[0] == 0:
                     continue
-                bounds[(rec, roi)] = (float(events[0, 2]), float(events[-1, 2]))
+                bounds[(rec, roi)] = (float(dataset[0, 2]), float(dataset[-1, 2]))
     return bounds
 
 

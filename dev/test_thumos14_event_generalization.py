@@ -1,11 +1,3 @@
-"""Tests for the cross-domain proposal protocol on THUMOS14-E.
-
-Checks that the target prototype is built only from the explicit validation
-recordings, that both domains declare their minimum proposal duration, that a
-missing video is rejected instead of skipped, and that stage 1 matches the frozen
-source recipe.
-"""
-
 from __future__ import annotations
 
 import json

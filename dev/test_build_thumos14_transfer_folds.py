@@ -1,10 +1,3 @@
-"""Tests for the construction of the THUMOS14 transfer folds.
-
-Checks that fold assignment is deterministic and split-safe, that every fold sees
-every class plus negatives, and that a fold file differs from the source only in
-which videos are marked for validation.
-"""
-
 import copy
 import unittest
 

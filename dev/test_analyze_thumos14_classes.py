@@ -1,10 +1,3 @@
-"""Tests for the THUMOS14 class analysis and its jackknife stability check.
-
-Checks that class selection only reads the requested split, that filtering remaps
-label ids while keeping every video, and that the jackknife reports a bounded
-selection frequency.
-"""
-
 import copy
 import unittest
 

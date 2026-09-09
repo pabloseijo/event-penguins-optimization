@@ -1,11 +1,3 @@
-"""Augmented Temporal Segment Network, the classifier of the reTAG pipeline.
-
-A ResNet-18 backbone encodes every temporal sample of a proposal, the samples are
-averaged inside three segments (left context, proposal, right context) and the
-concatenation is classified. The optional input adapter and temporal-difference
-head are project additions, off by default so the released weights load unchanged.
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -16,7 +8,6 @@ from torchvision.models.feature_extraction import create_feature_extractor
 
 
 class Consensus(nn.Module):
-    """Average pooling over the temporal-sample dimension of a segment."""
 
     def __init__(self, dim: int = 1) -> None:
         super().__init__()
@@ -27,13 +18,6 @@ class Consensus(nn.Module):
 
 
 class TemporalDifferenceHead(nn.Module):
-    """Auxiliary head over first-order differences between consecutive samples.
-
-    The averaged features of a segment are order-invariant, so a display and its
-    time-reversed copy look identical to the main head. This head consumes the
-    differences instead. It is zero-initialised, so enabling it leaves the network
-    output unchanged at step zero.
-    """
 
     def __init__(self, in_channels: int, hidden_channels: int, num_classes: int) -> None:
         super().__init__()
@@ -64,18 +48,6 @@ class TemporalDifferenceHead(nn.Module):
 
 
 class AugmentedTsn(nn.Module):
-    """TSN classifier over event time surfaces, with optional project extensions.
-
-    Args:
-        num_classes: number of output classes (2 in the ED setting).
-        num_tsn_samples: temporal samples inside the proposal.
-        augment_factor: inverse of the context fraction added on each side.
-        use_input_adapter: map one channel of a normalised input back to the
-            repeated-gray input the released weights were trained on.
-        input_adapter_source_channel: which channel the adapter reads.
-        use_temporal_difference_head: add the auxiliary difference head.
-        temporal_hidden_channels: hidden width of that head.
-    """
 
     def __init__(
         self,
@@ -100,7 +72,7 @@ class AugmentedTsn(nn.Module):
             backbone, return_nodes={"layer4.1.relu_1": "features"}
         )
 
-        # dry run: read the channel count instead of hard-coding ResNet internals
+        # execución en seco para obter o número de canles sen acoplar ao interno de ResNet
         with torch.no_grad():
             out = self.backbone(torch.randn(1, 3, 224, 224))["features"]
         in_channels = out.shape[1]

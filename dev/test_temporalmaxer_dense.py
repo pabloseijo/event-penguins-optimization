@@ -1,9 +1,3 @@
-"""Tests for the dense TemporalMaxer heads, their training loop and decoding.
-
-Covers exposed frame features, duration handling, TANP behaviour at zero and
-non-zero sigma, and the shape and gradient contracts of the detector.
-"""
-
 from __future__ import annotations
 
 import json

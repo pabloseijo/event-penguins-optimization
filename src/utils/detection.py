@@ -1,52 +1,54 @@
-"""Temporal IoU and non-maximum suppression for 1-D action detections.
-
-Detections are ``[n, 3]`` arrays of ``[t_start, t_end, score]``. Times may be in
-seconds or microseconds as long as one run stays consistent.
-"""
-
 import numpy as np
 
 
 def temporal_iou(proposal_min, proposal_max, gt_min, gt_max):
-    """Intersection over union between one segment and an array of segments.
+    """
+    Compute IoU score between a groundtruth bbox and the proposals.
 
     Args:
-        proposal_min: start of the candidate segments.
-        proposal_max: end of the candidate segments.
-        gt_min: start of the reference segment.
-        gt_max: end of the reference segment.
+        proposal_min: List of temporal anchor min.
+        proposal_max: List of temporal anchor max.
+        gt_min: Groundtruth temporal box min.
+        gt_max: Groundtruth temporal box max.
 
     Returns:
-        tIoU in ``[0, 1]``, broadcast over the candidate array.
+        list[float]: List of iou scores.
     """
     len_anchors = proposal_max - proposal_min
     int_tmin = np.maximum(proposal_min, gt_min)
     int_tmax = np.minimum(proposal_max, gt_max)
     inter_len = np.maximum(int_tmax - int_tmin, 0.0)
     union_len = len_anchors - inter_len + gt_max - gt_min
-    return np.divide(inter_len, union_len)
+    jaccard = np.divide(inter_len, union_len)
+    return jaccard
 
 
 def temporal_nms(detections: np.ndarray, threshold: float) -> np.ndarray:
-    """Greedy non-maximum suppression over temporal detections.
+    """
+    Perform 1D non-maximum suppression on n detections
 
     Args:
-        detections: ``[n, 3]`` array of ``[t_start, t_end, score]``.
-        threshold: candidates overlapping a kept detection above this tIoU are dropped.
+        detections: Detection results before NMS (n x 3).
+                    Each detection has form (t_start, t_end, score)
+        threshold: Threshold of NMS.
 
     Returns:
-        The surviving rows of ``detections``, ordered by decreasing score.
+        Detection results after NMS.
     """
     starts = detections[:, 0]
     ends = detections[:, 1]
     scores = detections[:, 2]
+
     order = scores.argsort()[::-1]
+
     keep = []
     while order.size > 0:
         i = order[0]
         keep.append(i)
         ious = temporal_iou(starts[order[1:]], ends[order[1:]], starts[i], ends[i])
-        order = order[np.where(ious <= threshold)[0] + 1]
+        idxs = np.where(ious <= threshold)[0]
+        order = order[idxs + 1]
+
     return detections[keep, :]
 
 
@@ -55,19 +57,19 @@ def temporal_soft_nms(
     sigma: float = 0.5,
     score_threshold: float = 0.001,
 ) -> np.ndarray:
-    """Soft-NMS with gaussian decay for 1-D temporal detections.
+    """Soft-NMS with Gaussian score decay for 1D temporal detections.
 
-    Overlapping detections have their score decayed instead of being removed, so a
-    display adjacent in time to a higher-scoring one survives instead of being
-    erased by hard suppression.
+    Instead of hard suppression, reduces scores of overlapping proposals
+    proportionally to their IoU. Preserves adjacent actions that hard NMS
+    would eliminate.
 
     Args:
-        detections: ``[n, 3]`` array of ``[t_start, t_end, score]``.
-        sigma: width of the gaussian decay; smaller values suppress harder.
-        score_threshold: detections decayed below this score are dropped.
+        detections: Array (n x 3) with columns [t_start, t_end, score].
+        sigma: Gaussian decay width. Higher → softer penalization.
+        score_threshold: Proposals with score below this are discarded.
 
     Returns:
-        Surviving detections with updated scores, ordered by decreasing score.
+        Filtered detections sorted by score descending.
     """
     dets = detections.copy()
     scores = dets[:, 2].copy()
@@ -76,6 +78,7 @@ def temporal_soft_nms(
     keep = []
 
     while indices:
+        # pick highest-score remaining detection
         best_local = int(np.argmax(scores[indices]))
         best = indices[best_local]
         keep.append(best)

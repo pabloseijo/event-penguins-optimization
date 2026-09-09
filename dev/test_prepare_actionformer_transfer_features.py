@@ -1,10 +1,3 @@
-"""Tests for the feature preparation of the ActionFormer transfer.
-
-Checks temporal IoU and class matching, the fallback moments of empty intervals,
-that completeness rewards the interior over the context, and that a prepared
-video yields named, finite features.
-"""
-
 import unittest
 
 import numpy as np
@@ -94,29 +87,6 @@ class PrepareActionFormerTransferFeaturesTest(unittest.TestCase):
         self.assertEqual(output["features"].shape, (1, len(FEATURE_NAMES)))
         self.assertTrue(np.isfinite(output["features"]).all())
         self.assertAlmostEqual(float(output["target_tiou"][0]), 1.0)
-
-    def test_inference_preparation_omits_quality_target(self):
-        raw = {
-            "video_id": np.asarray("video"),
-            "video_duration": np.asarray(2.0, dtype=np.float32),
-            "segments": np.asarray([[0.0, 1.0]], dtype=np.float32),
-            "scores": np.asarray([0.8], dtype=np.float32),
-            "logits": np.asarray([1.3862944], dtype=np.float32),
-            "labels": np.asarray([0], dtype=np.int64),
-            "levels": np.asarray([0], dtype=np.int64),
-            "point_strides": np.asarray([0.5], dtype=np.float32),
-            "offsets": np.asarray([[1.0, 1.0]], dtype=np.float32),
-            "dense_times": np.asarray([0.0, 1.0], dtype=np.float32),
-            "dense_logits": np.asarray([[0.0], [0.0]], dtype=np.float32),
-        }
-        output = prepare_video(
-            raw,
-            np.empty((0, 2), dtype=np.float32),
-            np.empty(0, dtype=np.int64),
-            context_ratio=0.5,
-            include_target=False,
-        )
-        self.assertNotIn("target_tiou", output)
 
     def test_quality_target_uses_post_nms_video_clipping(self):
         raw = {

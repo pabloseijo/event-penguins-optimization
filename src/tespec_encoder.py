@@ -69,15 +69,6 @@ class TespecEncoder(nn.Module):
         x: torch.Tensor,
         previous: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Encode one event frame and return its pooled feature and LSTM state.
-
-        Args:
-            x: ``[B, 20, H, W]`` event representation of a single step.
-            previous: per-stage LSTM state from the previous step, or None to start.
-
-        Returns:
-            Tuple of the pooled feature vector and the updated per-stage state.
-        """
         features = []
         states = []
         for index, layer in enumerate(self.pure_backbone.children()):
@@ -93,17 +84,6 @@ class TespecEncoder(nn.Module):
         return F.adaptive_avg_pool2d(last, 1).flatten(1), states
 
     def forward(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Encode a sequence of event frames recurrently.
-
-        Args:
-            sequence: ``[B, T, 20, H, W]`` event representation.
-
-        Returns:
-            ``[B, T, D]`` per-step features.
-
-        Raises:
-            ValueError: if the input does not have 20 channels.
-        """
         if sequence.ndim != 5 or sequence.shape[2] != 20:
             raise ValueError(
                 "Expected TESPEC input with shape (B, T, 20, H, W), "
@@ -117,18 +97,6 @@ class TespecEncoder(nn.Module):
         return torch.stack(outputs, dim=1)
 
     def load_pretrained(self, checkpoint_path: str | Path) -> None:
-        """Load the released TESPEC encoder weights from a checkpoint.
-
-        Only the ``model.encoder.`` entries are read; the reconstruction decoder is not
-        needed downstream. Any missing or unexpected key is an error rather than a
-        warning, so a silently half-loaded encoder cannot reach an experiment.
-
-        Args:
-            checkpoint_path: path to the released checkpoint.
-
-        Raises:
-            ValueError: if the checkpoint holds no encoder weights, or if they do not match.
-        """
         try:
             checkpoint = torch.load(
                 checkpoint_path,

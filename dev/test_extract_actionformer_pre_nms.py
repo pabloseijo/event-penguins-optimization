@@ -1,10 +1,3 @@
-"""Tests for the extraction of ActionFormer candidates before NMS.
-
-Checks the feature-grid to seconds conversion against the published formula, that
-decoding preserves logit, label, level and offsets, that concatenation preserves
-candidate order, and that candidates stay unclipped until after NMS.
-"""
-
 import unittest
 
 import torch

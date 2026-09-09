@@ -1,10 +1,3 @@
-"""Tests for the THUMOS14-E proposal evaluation and its protocol declaration.
-
-Checks that the protocol declares one corpus and twenty class tasks, that the
-manifest requires the canonical 212 test videos, and that microsecond proposals
-reach the metrics with the right units.
-"""
-
 from __future__ import annotations
 
 import tempfile

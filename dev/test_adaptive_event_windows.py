@@ -1,9 +1,3 @@
-"""Tests for density-adaptive sample durations in the proposal dataset.
-
-Checks that the window length tracks event density, stays inside its bounds,
-rejects invalid arguments and lets a per-row duration override the default.
-"""
-
 from __future__ import annotations
 
 import unittest

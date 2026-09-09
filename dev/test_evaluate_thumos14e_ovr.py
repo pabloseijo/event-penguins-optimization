@@ -1,9 +1,3 @@
-"""Tests for the one-versus-rest aggregation on THUMOS14-E.
-
-Checks that aggregation uses the canonical video list and the declared class,
-which is what keeps a per-class number comparable with the published protocol.
-"""
-
 from __future__ import annotations
 
 import json

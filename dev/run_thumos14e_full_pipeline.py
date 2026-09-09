@@ -54,6 +54,24 @@ from dev.train_temporalmaxer_dense import (  # noqa: E402
 
 
 THUMOS_TIOU = (0.3, 0.4, 0.5, 0.6, 0.7)
+# DESVIACION DECLARADA DO PROTOCOLO (2026-09-08).
+#
+# O lattice ten 4.078.243 propostas por fold (3,0 M train + 1,07 M val) e o
+# pipeline extraia embeddings ATSN de TODAS elas para despois adestrar con
+# 140.000 (max_train_samples). Medido nesta maquina: 17.230 propostas/h, ou 237
+# h por fold, ou 23.700 h para as 20 clases x 5 folds. Non existe.
+#
+# Recortase o conxunto de propostas ANTES de extraer as representacions.
+# limit_frame usa df.sample(), mostraxe aleatoria uniforme, asi que non introduce
+# nesgo de seleccion; o que se perde e riqueza no conxunto de onde saen os
+# negativos duros. Con 50.000 train quedan 2,8 candidatos por cada mostra de
+# adestramento, que mantén a mineria viva.
+#
+# Anotar na taboa de resultados: as cifras de CoTAD veñen dun lattice submostrado
+# a 50k/20k por fold, non do lattice completo.
+QUALITY_MAX_TRAIN_PROPOSALS = 50000
+QUALITY_MAX_VAL_PROPOSALS = 20000
+
 QUALITY_CONFIG = {
     "epochs": 18,
     "batch_size": 4096,
@@ -124,6 +142,23 @@ def run_if_missing(command: list[str], expected: Path, log_path: Path) -> None:
 def shared_feature_dirs(plan: dict[str, object]) -> tuple[Path, Path]:
     root = Path(plan["paths"]["out_root"]) / "shared_features"
     return root / "continuous", root / "event_stats"
+
+
+def shared_timestamp_cache(plan: dict[str, object]) -> Path:
+    """Directorio unico de cache de timestamps para todo o corpus.
+
+    Antes cada fold e cada clase construia a sua propia copia (roi_timestamps
+    por fold, dense_roi_timestamps por clase): 20 clases x 5 folds mais unha
+    por clase son 120 copias dos mesmos arrays, ~15 GB cada unha. O contido e
+    funcion determinista de (corpus, gravacion, ROI), asi que compartilo e
+    seguro e aforra da orde de 1,5 TB.
+
+    Vai colgado de out_root, que e por corpus, para que o corpus v2e e o real
+    NUNCA compartan cache: as rutas de ProposalDataset non levan clave de
+    procedencia (src/classification.py:175), asi que mesturalos daria
+    timestamps incorrectos en silencio.
+    """
+    return Path(plan["paths"]["out_root"]) / "shared_features" / "roi_timestamps"
 
 
 def expected_corpus_recordings(plan: dict[str, object]) -> set[str]:
@@ -451,6 +486,7 @@ def quality_train_command(
     train_path: Path,
     val_path: Path,
     out_dir: Path,
+    timestamp_cache_dir: Path,
     args: argparse.Namespace,
 ) -> list[str]:
     return [
@@ -468,6 +504,8 @@ def quality_train_command(
         "--repr-batch-size", str(args.qhead_repr_batch_size),
         "--num-workers", str(args.num_workers),
         "--max-train-samples", str(QUALITY_CONFIG["max_train_samples"]),
+        "--max-train-proposals", str(QUALITY_MAX_TRAIN_PROPOSALS),
+        "--max-val-proposals", str(QUALITY_MAX_VAL_PROPOSALS),
         "--group-dro",
         "--group-dro-eta", str(QUALITY_CONFIG["group_dro_eta"]),
         "--lr", str(QUALITY_CONFIG["learning_rate"]),
@@ -476,6 +514,7 @@ def quality_train_command(
         "--min-gt-duration", "0.0",
         "--min-score", "0.1",
         "--pre-nms-topk-per-roi", "0",
+        "--timestamp-cache-dir", str(timestamp_cache_dir),
         "--tiou", *(str(value) for value in THUMOS_TIOU),
         "--seed", str(args.seed),
         "--device", args.device,
@@ -524,6 +563,7 @@ def dense_train_command(
     cache_dir: Path,
     out_dir: Path,
     args: argparse.Namespace,
+    timestamp_cache_dir: Path,
 ) -> list[str]:
     return [
         sys.executable,
@@ -535,7 +575,7 @@ def dense_train_command(
         "--train-proposals", str(train_path),
         "--val-proposals", str(val_path),
         "--cache-dir", str(cache_dir),
-        "--timestamp-cache-dir", str(cache_dir.parent / "roi_timestamps"),
+        "--timestamp-cache-dir", str(timestamp_cache_dir),
         "--out-dir", str(out_dir),
         "--epochs", str(DENSE_CONFIG["epochs"]),
         "--patience", str(DENSE_CONFIG["patience"]),
@@ -592,7 +632,8 @@ def run_local_fold(args: argparse.Namespace) -> None:
     qhead_checkpoint = qhead_dir / "qhead_qfl_only.pt"
     run_if_missing(
         quality_train_command(
-            data_path, annotations, source_model, train_path, val_path, qhead_dir, args
+            data_path, annotations, source_model, train_path, val_path, qhead_dir,
+            shared_timestamp_cache(plan), args
         ),
         qhead_checkpoint,
         qhead_dir / "run.log",
@@ -639,6 +680,7 @@ def run_local_fold(args: argparse.Namespace) -> None:
             fold_dir / "dense_cache",
             dense_dir,
             args,
+            shared_timestamp_cache(plan),
         ),
         dense_checkpoint,
         dense_dir / "run.log",
@@ -799,7 +841,7 @@ def run_local_test(args: argparse.Namespace) -> None:
         "--model-path", str(source_model),
         "--master-proposals", str(hybrid_path),
         "--cache-dir", str(dense_cache),
-        "--timestamp-cache-dir", str(out_dir / "dense_roi_timestamps"),
+        "--timestamp-cache-dir", str(shared_timestamp_cache(plan)),
         "--out-dir", str(out_dir / "dense_extract"),
         "--extract-only",
         "--repr-batch-size", str(args.dense_repr_batch_size),
@@ -1033,7 +1075,7 @@ def run_full_test(args: argparse.Namespace) -> None:
                 "event-statistics TemporalMaxer expert",
                 "global percentile-rank fusion",
                 "context-relative completeness and linear QFL",
-                "Gaussian Soft-NMS sigma=0.5",
+                "Gaussian Soft-NMS sigma=0.25",
             ],
             "prediction_sha256": sha256_file(out_dir / "predictions.json"),
         },

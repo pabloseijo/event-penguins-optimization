@@ -1,31 +1,7 @@
-"""Stage 1: temporal proposal generation from per-ROI event streams.
-
-The reTAG baseline (Hamann et al., CVPR 2024) reduces an event stream to a 1-D
-event rate, normalises it robustly, thresholds it over a grid of actionness
-values and groups the resulting basins into proposals. This module keeps that
-skeleton intact and adds the descriptors studied in phase 1 of the project, each
-one opt-in so the baseline stays reproducible unchanged:
-
-* an adaptive threshold grid centred on the actionness distribution itself;
-* spatial compactness of the event cloud;
-* two noise indicators, for flat sustained noise and for precipitation;
-* similarity to a spatial prototype of the Ecstatic Display;
-* a periodicity penalty in the wing-flapping band.
-
-Actionness is combined multiplicatively, so a descriptor that is silent leaves
-the baseline signal untouched::
-
-    a(t) = norm( r(t) · (1 + w_c·c(t)) · (1 + w_p·p(t)) · (1 − w_f·f(t)) · (1 − w_n·n(t)) )
-
-where ``r`` is the normalised event rate, ``c`` compactness, ``p`` the prototype
-similarity, ``f`` the periodicity indicator and ``n`` the noise indicators.
-
-Times are handled in microseconds throughout, matching the raw event timestamps.
-"""
-
 from __future__ import annotations
 
 import os
+import multiprocessing as _mp
 from multiprocessing import Pool
 from typing import Iterable, Optional
 
@@ -59,56 +35,46 @@ def _detect_runs(
     return result
 
 
-def get_event_rate(events: np.ndarray, bin_width: float) -> tuple:
-    """Histogram event timestamps into fixed-width temporal bins.
+EVENT_CHUNK = 25_000_000
+"""Eventos por bloque ao percorrer un ROI. Fixa o pico de memoria en ~400 MB."""
 
-    Args:
-        events: ``[n, 4]`` array of ``[x, y, t, p]``, sorted by timestamp.
-        bin_width: bin width in microseconds.
 
-    Returns:
-        Tuple of per-bin event counts and the bin edges.
+def get_event_rate(events, bin_width: float) -> tuple:
+    """Taxa de eventos por bin. Acepta un array ou un dataset HDF5 sen ler.
+
+    Percorrese por bloques: no corpus real hai gravacions de 1.467.653.571
+    eventos, e materializar events[:, 2] son 5,9 GB que o OOM killer non
+    perdoa. As contas dun histograma son aditivas sobre bloques disxuntos, e
+    fixanse os bordes explicitamente a partir de (t_min, t_max), que e o mesmo
+    rango que np.histogram deduciria do array completo porque os timestamps
+    veñen ordenados. O resultado e identico, non aproximado.
     """
     t_min, t_max = events[0, 2], events[-1, 2]
     bin_num = int((t_max - t_min) / bin_width)
-    counts, bins = np.histogram(events[:, 2], bins=bin_num)
+    bins = np.linspace(t_min, t_max, bin_num + 1)
+    counts = np.zeros(bin_num, dtype=np.int64)
+    n = len(events)
+    for ini in range(0, n, EVENT_CHUNK):
+        bloque = np.asarray(events[ini : min(ini + EVENT_CHUNK, n), 2])
+        parcial, _ = np.histogram(bloque, bins=bins)
+        counts += parcial
+        del bloque
     return counts, bins
 
 
 def apply_robust_min_max(rate: np.ndarray, percentile: float) -> np.ndarray:
-    """Clip the event rate to a symmetric percentile range.
-
-    ``percentile`` is the total share of samples to clip, split evenly between both
-    tails, which is how reTAG keeps a single burst of events from compressing the
-    whole normalised signal.
-
-    Args:
-        rate: per-bin event counts.
-        percentile: total percentage clipped across both tails.
-
-    Returns:
-        The clipped rate (modified in place).
-    """
+    # `rate` chega como int64 desde np.histogram, e os percentís son float: asignalos a un array
+    # enteiro truncábaos en silencio (un límite de 12,8 recortaba a 12). Trabállase en float.
+    rate = np.asarray(rate, dtype=np.float64)
     rmin = np.percentile(rate.flat, 0.5 * percentile)
     rmax = np.percentile(rate.flat, 100 - 0.5 * percentile)
-    rate[rate < rmin] = rmin
-    rate[rate > rmax] = rmax
-    return rate
+    return np.clip(rate, rmin, rmax)
 
 
 def get_index_proposals_from_1d_score(
     score1d: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
-    """Return the ``[start, end)`` bin indices of every run above ``threshold``.
-
-    Args:
-        score1d: per-bin actionness.
-        threshold: actionness value that separates active from inactive bins.
-
-    Returns:
-        ``[m, 2]`` array of bin index pairs, one row per basin.
-    """
     return np.where(np.diff(score1d > threshold, prepend=0, append=0))[0].reshape(-1, 2)
 
 
@@ -118,20 +84,6 @@ def check_merge_possible(
     accumulated_duration: float,
     threshold: float,
 ) -> bool:
-    """Decide whether two basins belong to the same proposal.
-
-    Merging is accepted when the active time inside the candidate span stays above
-    ``threshold``: a short gap between two long basins is bridged, a long gap is not.
-
-    Args:
-        proposal_1: bin indices of the group being accumulated.
-        proposal_2: bin indices of the next basin.
-        accumulated_duration: active bins accumulated so far, in bins.
-        threshold: minimum active fraction of the merged span.
-
-    Returns:
-        True when the two basins should be merged.
-    """
     candidate_active = accumulated_duration + (proposal_2[1] - proposal_2[0])
     candidate_span = proposal_2[1] - proposal_1[0]
     return candidate_active / candidate_span > threshold
@@ -143,22 +95,6 @@ def merge_proposals(
     grouping_thres: float,
     times: np.ndarray,
 ) -> list:
-    """Group consecutive basins into proposals under a grouping threshold.
-
-    Args:
-        unmerged: ``[m, 2]`` bin index pairs from ``get_index_proposals_from_1d_score``.
-        score: per-bin actionness, averaged over each proposal to score it.
-        grouping_thres: minimum active fraction required to bridge a gap.
-        times: bin edges, used to convert bin indices back to timestamps.
-
-    Returns:
-        List of ``[t_start, t_end, mean_score]``, one per merged proposal.
-
-    Note:
-        The final group is flushed after the loop. The original implementation only
-        appended when a merge was rejected, so it silently dropped the last proposal
-        of every ROI.
-    """
     merged = []
     current = None
     accumulated_basin_durations = 0
@@ -183,7 +119,7 @@ def merge_proposals(
                 current = next_proposal
                 accumulated_basin_durations = next_proposal[1] - next_proposal[0]
 
-    # the original loop only flushed on a rejected merge, dropping the last group
+    # o último elemento quedaba sen engadir ao rematar o bucle no código orixinal
     if current is not None:
         merged.append([
             times[current[0]],
@@ -204,26 +140,12 @@ def pad_short_proposals(
     t_max: float,
     score_scale: float = 1.0,
 ) -> np.ndarray:
-    """Pad short, salient bursts into windows long enough to survive.
+    """Engade xanelas mínimas arredor de bursts curtos e salientables.
 
-    The generator drops any proposal shorter than the minimum duration. During a
-    short display the signal can arrive as fragmented bursts that individually
-    miss that bound even though the annotated action clears it. This helper keeps
-    those hypotheses without looking at any annotation: it centres a minimum-length
-    window on the short burst.
-
-    Args:
-        proposals: list of ``[t_start, t_end, score]`` in microseconds.
-        target_duration_us: length of the padded window.
-        min_source_duration_us: shortest burst eligible for padding.
-        max_source_duration_us: longest burst eligible for padding.
-        min_score: minimum score a burst needs to be padded.
-        t_min: earliest timestamp of the recording, used to clamp the window.
-        t_max: latest timestamp of the recording.
-        score_scale: multiplier applied to the score of padded windows.
-
-    Returns:
-        The original proposals with the padded windows appended.
+    O xerador orixinal descarta calquera proposta de menos de 2 s. En EDs curtas,
+    o sinal pode aparecer como bursts fragmentados que non chegan a esa duración
+    aínda que a acción anotable si a supere. Este helper conserva esas hipóteses
+    sen mirar anotacións: centra unha xanela mínima arredor do burst curto.
     """
     if len(proposals) == 0:
         return np.empty((0, 3), dtype=np.float64)
@@ -256,24 +178,8 @@ def get_adaptive_actioness_thresholds(
     delta: float = 0.10,
     step: float = 0.05,
 ) -> np.ndarray:
-    """Build a threshold grid centred on the actionness distribution of this ROI.
-
-    The baseline sweeps a fixed grid from 0.05 to 0.95, which spends most of its
-    thresholds far from where the signal actually lives. Centring the grid on a
-    percentile of the observed actionness adapts the sweep to each ROI without
-    looking at any annotation.
-
-    Args:
-        actioness: per-bin actionness of one ROI.
-        central_percentile: percentile used as the centre of the grid.
-        delta: half-width of the grid around the centre.
-        step: spacing between consecutive thresholds.
-
-    Returns:
-        Sorted unique thresholds, clipped to ``[0.05, 0.95]``.
-    """
     lambda_center = np.percentile(actioness, central_percentile)
-    # +1e-9 so np.arange keeps the upper end despite floating-point rounding
+    # +1e-9 para que np.arange inclúa o extremo superior con redondeo flotante
     thresholds = np.arange(lambda_center - delta, lambda_center + delta + 1e-9, step)
     thresholds = np.clip(thresholds, 0.05, 0.95)
     return np.unique(np.round(thresholds, 4))
@@ -287,36 +193,37 @@ def get_spatial_compactness(
     sigmoid_k: float = 10.0,
     sigmoid_d0: float = 0.5,
 ) -> np.ndarray:
-    """Per-bin compactness of the event cloud inside the ROI.
-
-    An Ecstatic Display is one bird moving on its nest, so its events stay spatially
-    concentrated; wind over the whole scene does not. Compactness is the spatial
-    spread of the events of a bin, mapped through a sigmoid so that concentrated
-    bins score near 1 and scattered bins near 0.
-
-    Args:
-        events: ``[n, 4]`` array of ``[x, y, t, p]``.
-        bins: bin edges from ``get_event_rate``.
-        roi_height: ROI height in pixels, used to normalise the spread.
-        roi_width: ROI width in pixels.
-        sigmoid_k: steepness of the sigmoid.
-        sigmoid_d0: normalised spread at which the sigmoid crosses 0.5.
-
-    Returns:
-        Per-bin compactness in ``[0, 1]``; bins with fewer than two events score 0.
-    """
     bin_num = len(bins) - 1
-    bin_idx = np.searchsorted(bins[1:], events[:, 2], side='right')
-    bin_idx = np.clip(bin_idx, 0, bin_num - 1)
 
-    x = events[:, 0].astype(np.float64)
-    y = events[:, 1].astype(np.float64)
-
-    count = np.bincount(bin_idx, minlength=bin_num).astype(np.float64)
-    sum_x = np.bincount(bin_idx, weights=x, minlength=bin_num)
-    sum_y = np.bincount(bin_idx, weights=y, minlength=bin_num)
-    sum_x2 = np.bincount(bin_idx, weights=x * x, minlength=bin_num)
-    sum_y2 = np.bincount(bin_idx, weights=y * y, minlength=bin_num)
+    # Acumulación por bloques. A versión anterior materializaba x, y, x*x e y*y
+    # enteiros: con 634 M eventos (THUMOS14-E) son 20 GB de temporais por ROI, e
+    # tres workers á vez esgotaban os 62 GB da máquina. A aritmética é idéntica
+    # —float64 en todo— e o resultado tamén; só cambia canta memoria vive á vez.
+    #
+    # 2026-09-05: o bin_idx completo tamén se saía. Calculábase dunha vez para
+    # todos os eventos, e no corpus real iso son 11,7 GB nunha gravación de
+    # 1.467.653.571 eventos. Agora calcúlase dentro do bucle, e o bloque léese
+    # unha soa vez en vez de tres slices por columna: `events` pode ser un
+    # dataset HDF5 sen ler, e cada slice sería unha lectura completa dos chunks.
+    _CHUNK = EVENT_CHUNK
+    count = np.zeros(bin_num, dtype=np.float64)
+    sum_x = np.zeros(bin_num, dtype=np.float64)
+    sum_y = np.zeros(bin_num, dtype=np.float64)
+    sum_x2 = np.zeros(bin_num, dtype=np.float64)
+    sum_y2 = np.zeros(bin_num, dtype=np.float64)
+    _n = len(events)
+    for _ini in range(0, _n, _CHUNK):
+        _blq = np.asarray(events[_ini : min(_ini + _CHUNK, _n)])
+        _bi = np.searchsorted(bins[1:], _blq[:, 2], side='right')
+        _bi = np.clip(_bi, 0, bin_num - 1)
+        _x = _blq[:, 0].astype(np.float64)
+        _y = _blq[:, 1].astype(np.float64)
+        count += np.bincount(_bi, minlength=bin_num)
+        sum_x += np.bincount(_bi, weights=_x, minlength=bin_num)
+        sum_y += np.bincount(_bi, weights=_y, minlength=bin_num)
+        sum_x2 += np.bincount(_bi, weights=_x * _x, minlength=bin_num)
+        sum_y2 += np.bincount(_bi, weights=_y * _y, minlength=bin_num)
+        del _blq, _bi, _x, _y
 
     safe_count = np.maximum(count, 1.0)
     mean_x = sum_x / safe_count
@@ -341,21 +248,9 @@ def get_sustained_noise_indicator(
     high_percentile: float = 98,
     variance_window: int = 10,
 ) -> np.ndarray:
-    """Detect flat, sustained background noise such as wind or vibration.
+    """Detecta ruído de fondo sostido e temporalmente plano (vento, vibración).
 
-    Three criteria must hold at once: a high event rate, low local variance, and a
-    stretch lasting at least ``min_duration_s``. A display fails the second one,
-    which is what separates it from a windy stretch of similar magnitude.
-
-    Args:
-        rate: per-bin event counts.
-        bin_width_us: bin width in microseconds.
-        min_duration_s: seconds a stretch must last to count as noise.
-        high_percentile: rate percentile that counts as high activity.
-        variance_window: bins in the local variance window.
-
-    Returns:
-        Per-bin indicator in ``{0, 1}``.
+    Tres criterios: taxa alta, varianza local baixa, sostido polo menos min_duration_s s.
     """
     above = rate >= np.percentile(rate, high_percentile)
 
@@ -377,22 +272,10 @@ def get_dispersed_noise_indicator(
     high_percentile: float = 90,
     dispersion_percentile: float = 20,
 ) -> np.ndarray:
-    """Detect precipitation: a high event rate spread over the whole ROI.
+    """Detecta precipitación (neve, chuvia): taxa alta con compacidade baixa.
 
-    This complements :func:`get_sustained_noise_indicator`. Snow and rain have high
-    temporal variance, so they never pass the flat-signal test, but their
-    compactness sits near zero because the events cover the frame.
-
-    Args:
-        rate: per-bin event counts.
-        compactness: per-bin compactness from :func:`get_spatial_compactness`.
-        bin_width_us: bin width in microseconds.
-        min_duration_s: seconds a stretch must last to count as noise.
-        high_percentile: rate percentile that counts as high activity.
-        dispersion_percentile: compactness percentile that counts as dispersed.
-
-    Returns:
-        Per-bin indicator in ``{0, 1}``.
+    Complementa get_sustained_noise_indicator: a neve ten varianza temporal alta
+    polo que non pasa o criterio de sinal plana, pero si ten compacidade próxima a cero.
     """
     above = rate >= np.percentile(rate, high_percentile)
     dispersed = compactness <= np.percentile(compactness, dispersion_percentile)
@@ -409,24 +292,11 @@ def get_periodicity_indicator(
     local_threshold: float = 0.30,
     min_duration_s: float = 3.0,
 ) -> np.ndarray:
-    """Detect rhythmic activity in the wing-flapping band (0.5-3 Hz).
+    """Detecta actividade periódica na franxa de frecuencia de batido de ás (0.5–3 Hz).
 
-    Wing flapping is periodic; an Ecstatic Display is not. Detection runs in two
-    stages: an FFT autocorrelation screens the ROI for a dominant lag, and a local
-    cross-correlation at that lag marks which bins are actually periodic.
-
-    Args:
-        rate: per-bin event counts.
-        bin_width_us: bin width in microseconds.
-        min_period_s: shortest period considered.
-        max_period_s: longest period considered.
-        window_s: window of the local cross-correlation.
-        global_threshold: autocorrelation needed to accept a dominant lag.
-        local_threshold: local correlation needed to mark a bin periodic.
-        min_duration_s: seconds a periodic stretch must last.
-
-    Returns:
-        Per-bin indicator in ``{0, 1}``; all zeros when no dominant lag is found.
+    Os batedores de ás son rítmicos; as EDs non teñen periodicidade.
+    Dúas etapas: criba global con autocorrelación FFT, logo correlación cruzada
+    local na lag dominante.
     """
     n = len(rate)
     bin_width_s = bin_width_us / 1e6
@@ -467,66 +337,13 @@ def get_periodicity_indicator(
     local_corr = (mean_XY - mean_X * mean_Y) / (std_X * std_Y + 1e-9)
     local_corr = np.clip(local_corr, 0.0, 1.0)
 
-    # the last T bins have no lagged counterpart to correlate against
+    # os últimos T bins non teñen sinal pareada
     local_corr_full = np.concatenate([local_corr, pad])[:n]
 
     return _detect_runs(local_corr_full >= local_threshold, bin_width_us, min_duration_s)
 
 
 class ProposalGenerator:
-    """reTAG proposal generator with the optional phase-1 descriptors.
-
-    With every switch left at its default the generator reproduces the CVPR 2024
-    baseline: normalised event rate, a fixed grid of actionness and grouping
-    thresholds, a minimum duration and temporal NMS. Each ``use_*`` flag turns on one
-    descriptor and its weight, and the enabled set is recorded in the name of the run
-    log so a result file always says which variant produced it.
-
-    Args:
-        data_path: HDF5 file produced by ``scripts/preprocess.py``.
-        bin_width: temporal bin width in seconds (converted to microseconds inside).
-        percentile: total share of samples clipped by the robust normalisation.
-        nms_threshold: tIoU above which overlapping proposals are suppressed.
-        output_dir: directory for the per-run text log.
-        use_adaptive_lambda: centre the threshold grid on the actionness percentile.
-        lambda_percentile: centre of the adaptive grid.
-        lambda_delta: half-width of the adaptive grid.
-        lambda_step: spacing of the adaptive grid.
-        use_spatial_compactness: multiply actionness by the compactness descriptor.
-        spatial_weight: weight of the compactness term.
-        compact_sigmoid_k: steepness of the compactness sigmoid.
-        compact_sigmoid_d0: normalised spread at the sigmoid midpoint.
-        use_noise_penalization: damp flat sustained noise (wind, vibration).
-        noise_percentile: rate percentile that counts as high activity.
-        noise_min_duration: seconds a noisy stretch must last to be penalised.
-        noise_weight: strength of the sustained-noise penalty.
-        noise_variance_window: bins in the local variance window.
-        use_dispersed_noise: damp precipitation (high rate, low compactness).
-        dispersed_noise_percentile: rate percentile that counts as high activity.
-        dispersed_noise_dispersion_percentile: compactness percentile that counts as dispersed.
-        dispersed_noise_min_duration: seconds a dispersed stretch must last.
-        dispersed_noise_weight: strength of the dispersed-noise penalty.
-        prototype: ED prototype grid from ``build_ed_prototype``, or None to disable.
-        prototype_weight: weight of the prototype similarity term.
-        use_periodicity: damp rhythmic activity in the wing-flapping band.
-        periodicity_min_period_s: shortest period considered periodic.
-        periodicity_max_period_s: longest period considered periodic.
-        periodicity_window_s: window of the local cross-correlation.
-        periodicity_global_threshold: autocorrelation needed to accept a dominant lag.
-        periodicity_local_threshold: local correlation needed to mark a bin periodic.
-        periodicity_min_duration_s: seconds a periodic stretch must last.
-        periodicity_weight: strength of the periodicity penalty.
-        use_short_proposal_padding: keep short salient bursts by padding them.
-        short_padding_target_duration_s: duration of the padded window.
-        short_padding_min_source_duration_s: shortest burst eligible for padding.
-        short_padding_max_source_duration_s: longest burst eligible for padding.
-        short_padding_min_score: minimum score of a burst eligible for padding.
-        short_padding_score_scale: score multiplier applied to padded windows.
-        minimum_proposal_duration_s: proposals shorter than this are dropped.
-
-    Raises:
-        ValueError: if ``minimum_proposal_duration_s`` is negative.
-    """
 
     def __init__(
         self,
@@ -644,27 +461,18 @@ class ProposalGenerator:
         self.grouping_thresholds = np.arange(0.05, 1, 0.05)
 
     def process_recording(self, rec: str) -> dict:
-        """Generate proposals for every ROI of one recording.
-
-        Runs the whole stage-1 chain per ROI: event rate, robust normalisation, the
-        enabled descriptors, the threshold and grouping sweep, the minimum duration and
-        temporal NMS. Intermediate statistics go to the run log, which is what makes a
-        variant auditable after the fact.
-
-        Args:
-            rec: recording name, i.e. a top-level group of the HDF5 file.
-
-        Returns:
-            Mapping from ROI id to a ``[n, 3]`` array of ``[t_start, t_end, score]``
-            in microseconds.
-        """
         rec_proposal_data = {}
         _log(self.log_file, f"\n[GRAVACIÓN] {rec}")
 
         with h5py.File(self.data_path, "r") as hf:
             data = hf[rec]
             for roi_id in data.keys():
-                events = np.array(data[roi_id]["events"])
+                # NON se materializa: no corpus real hai gravacions de
+                # 1.467.653.571 eventos, e np.array() diso son 23,5 GB. As
+                # tres funcions que o consumen (get_event_rate,
+                # get_spatial_compactness e get_prototype_score) percorren o
+                # dataset por bloques, asi que abonda con pasar o dataset.
+                events = data[roi_id]["events"]
                 roi_height = int(data[roi_id].attrs["height"])
                 roi_width = int(data[roi_id].attrs["width"])
 
@@ -684,7 +492,7 @@ class ProposalGenerator:
                     else np.zeros_like(rate, dtype=np.float64)
                 )
 
-                # computed once: both compactness and dispersed noise consume it
+                # compacidade calculada unha vez; reutilizada para ruído disperso
                 needs_compactness = self.use_spatial_compactness or self.use_dispersed_noise
                 if needs_compactness:
                     compactness = get_spatial_compactness(
@@ -834,22 +642,6 @@ class ProposalGenerator:
         split: Optional[str] = "test",
         recordings: Optional[Iterable[str]] = None,
     ) -> pd.DataFrame:
-        """Generate proposals for a split, or for an explicit list of recordings.
-
-        Recordings are processed in a process pool, one per worker.
-
-        Args:
-            split: split attribute to select recordings, or None for all of them.
-            recordings: explicit recording names. When given, they are checked against
-                ``split``, which is what keeps a cross-validation fold from silently
-                pulling in a recording of another split.
-
-        Returns:
-            DataFrame with ``rec_name``, ``roi_id``, ``t_start``, ``t_end`` and ``score``.
-
-        Raises:
-            ValueError: if a requested recording is missing or belongs to another split.
-        """
         logging.info("Executando o xerador de propostas.")
 
         with h5py.File(self.data_path, "r") as hf:
@@ -881,8 +673,39 @@ class ProposalGenerator:
 
         _log(self.log_file, f"\n[INFO] gravacións: {recording_names}")
 
-        with Pool(processes=16) as pool:
-            results = pool.map(self.process_recording, recording_names)
+        # Os vídeos de THUMOS14-E chegan a 634 M eventos (10 GB ao facer np.array).
+        # Con 16 workers iso afoga os 62 GB da máquina e parece un colgue.
+        # EventPenguins mantén 16 por defecto; THUMOS baixa por PROPOSALS_POOL.
+        _n_pool = int(os.environ.get("PROPOSALS_POOL", "16"))
+        #  chama a terminate() ao saír e queda esperando workers
+        # que non rematan: h5py con fork deixa locks colgados e o proceso morre
+        # en futex_do_wait co traballo xa feito. Con close()+join() e
+        # maxtasksperchild=1 os workers recíclanse e o peche é limpo.
+        # h5py non é fork-safe: tras centos de forks os workers quedan
+        # bloqueados en futex e o proceso morre co traballo case feito
+        # (180/200 de forma reproducible). Con spawn cada worker é un
+        # intérprete novo, sen herdar estado de HDF5.
+        if _n_pool <= 1:
+            # Sen multiprocessing: h5py con fork bloquea os workers en futex de
+            # forma reproducible sobre corpus grandes (THUMOS14-E paraba entre a
+            # gravación 139 e a 193 de 200, con calquera número de workers).
+            # Secuencial é máis lento pero non pode bloquearse.
+            results = [self.process_recording(r) for r in recording_names]
+        else:
+            results = None
+        _ctx = _mp.get_context("fork")
+        pool = None if results is not None else _ctx.Pool(
+            processes=_n_pool, maxtasksperchild=1)
+        try:
+            if pool is not None:
+                results = pool.map(self.process_recording, recording_names)
+                pool.close()
+                pool.join()
+        except BaseException:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+            raise
 
         rows = [
             {
@@ -904,20 +727,7 @@ class ProposalGenerator:
         split: Optional[str] = "test",
         merge_nms_threshold: float = 0.85,
     ) -> pd.DataFrame:
-        """Generate proposals at several bin widths and merge them with NMS.
-
-        A single bin width fixes the temporal resolution of the whole run, so short
-        and long displays cannot both be favoured. Running the generator once per
-        scale and merging keeps the best-scoring hypothesis of each.
-
-        Args:
-            bin_widths: bin widths in seconds, one run per value.
-            split: split to process, or None for every recording.
-            merge_nms_threshold: tIoU above which cross-scale duplicates are merged.
-
-        Returns:
-            DataFrame with the same columns as :meth:`run`.
-        """
+        """Xera propostas a múltiples escalas e fusiónaas con NMS."""
         import copy
 
         all_dfs = []

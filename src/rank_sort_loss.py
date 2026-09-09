@@ -97,24 +97,6 @@ def rank_sort_loss(
     targets: torch.Tensor,
     delta: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rank & Sort loss over a flat vector of logits.
-
-    Ranks positives above negatives and sorts them by their continuous target, which
-    is what lets localisation quality drive the ranking directly instead of being
-    approximated by a classification score.
-
-    Args:
-        logits: ``[n]`` raw scores.
-        targets: ``[n]`` continuous targets in ``[0, 1]``; zero marks a negative.
-        delta: smoothing of the step function used to approximate the rank.
-
-    Returns:
-        Tuple of the ranking error and the sorting error; both are zero when the batch
-        holds no positive.
-
-    Raises:
-        ValueError: if ``logits`` and ``targets`` do not have matching 1-D shapes.
-    """
     if logits.ndim != 1 or targets.shape != logits.shape:
         raise ValueError(
             f"RankSort expects matching vectors, got {logits.shape} and {targets.shape}"

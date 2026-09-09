@@ -61,31 +61,58 @@ def two_bin_window(values: np.ndarray) -> np.ndarray:
     return previous + values
 
 
-def sequence_features(
-    events: np.ndarray,
-    length: int,
-    stride_s: float,
-    width: int,
-    height: int,
-    spectral_bins: int,
-) -> np.ndarray:
+#: Eventos por bloque ao acumular. Un vídeo pode ter 1.600 millóns de eventos (25,8 GB como
+#: uint32), así que cargalos enteiros mata o proceso por OOM incluso con 62 GB de RAM. Todas as
+#: magnitudes que se acumulan son sumas por bin, e polo tanto aditivas entre bloques.
+EVENT_CHUNK = 20_000_000
+
+
+def _empty_accumulators(length: int) -> dict[str, np.ndarray]:
+    return {
+        name: np.zeros(length, dtype=np.float64)
+        for name in ("count", "polarity", "sum_x", "sum_y", "sum_x2", "sum_y2", "sum_xy")
+    }
+
+
+def accumulate_chunk(
+    events: np.ndarray, length: int, bin_width_us: float, acc: dict[str, np.ndarray]
+) -> None:
+    """Acumula as sumas por bin dun bloque de eventos. Aditivo: pódese chamar en secuencia."""
     if len(events) == 0:
-        return np.zeros((length, len(FEATURE_NAMES)), dtype=np.float32)
-    bin_width_us = stride_s * 1e6
+        return
     indices = np.floor(events[:, 2].astype(np.float64) / bin_width_us).astype(np.int64)
     valid = (indices >= 0) & (indices < length)
     indices = indices[valid]
+    if len(indices) == 0:
+        return
     x = events[valid, 0].astype(np.float64)
     y = events[valid, 1].astype(np.float64)
     polarity = np.where(events[valid, 3] > 0, 1.0, -1.0)
 
-    count_half = np.bincount(indices, minlength=length)[:length].astype(np.float64)
-    polarity_half = binned_sum(indices, polarity, length)
-    sum_x_half = binned_sum(indices, x, length)
-    sum_y_half = binned_sum(indices, y, length)
-    sum_x2_half = binned_sum(indices, x * x, length)
-    sum_y2_half = binned_sum(indices, y * y, length)
-    sum_xy_half = binned_sum(indices, x * y, length)
+    acc["count"] += np.bincount(indices, minlength=length)[:length].astype(np.float64)
+    acc["polarity"] += binned_sum(indices, polarity, length)
+    acc["sum_x"] += binned_sum(indices, x, length)
+    acc["sum_y"] += binned_sum(indices, y, length)
+    acc["sum_x2"] += binned_sum(indices, x * x, length)
+    acc["sum_y2"] += binned_sum(indices, y * y, length)
+    acc["sum_xy"] += binned_sum(indices, x * y, length)
+
+
+def features_from_accumulators(
+    acc: dict[str, np.ndarray],
+    length: int,
+    width: int,
+    height: int,
+    spectral_bins: int,
+) -> np.ndarray:
+    """Segunda metade do cálculo. Opera só sobre arrays de tamaño `length`, non sobre eventos."""
+    count_half = acc["count"]
+    polarity_half = acc["polarity"]
+    sum_x_half = acc["sum_x"]
+    sum_y_half = acc["sum_y"]
+    sum_x2_half = acc["sum_x2"]
+    sum_y2_half = acc["sum_y2"]
+    sum_xy_half = acc["sum_xy"]
 
     count = two_bin_window(count_half)
     polarity_sum = two_bin_window(polarity_half)
@@ -139,6 +166,45 @@ def sequence_features(
     return output.astype(np.float32)
 
 
+def sequence_features_chunked(
+    dataset,
+    length: int,
+    stride_s: float,
+    width: int,
+    height: int,
+    spectral_bins: int,
+    chunk: int = EVENT_CHUNK,
+) -> np.ndarray:
+    """Igual que a versión antiga pero sen materializar os eventos enteiros en RAM.
+
+    `dataset` é o dataset HDF5 sen ler (non un array), e lese en bloques de `chunk` eventos.
+    """
+    total = int(dataset.shape[0])
+    if total == 0:
+        return np.zeros((length, len(FEATURE_NAMES)), dtype=np.float32)
+    acc = _empty_accumulators(length)
+    bin_width_us = stride_s * 1e6
+    for start in range(0, total, chunk):
+        accumulate_chunk(dataset[start : start + chunk], length, bin_width_us, acc)
+    return features_from_accumulators(acc, length, width, height, spectral_bins)
+
+
+def sequence_features(
+    events: np.ndarray,
+    length: int,
+    stride_s: float,
+    width: int,
+    height: int,
+    spectral_bins: int,
+) -> np.ndarray:
+    """Envoltorio compatible para quen xa teña os eventos en memoria."""
+    if len(events) == 0:
+        return np.zeros((length, len(FEATURE_NAMES)), dtype=np.float32)
+    acc = _empty_accumulators(length)
+    accumulate_chunk(events, length, stride_s * 1e6, acc)
+    return features_from_accumulators(acc, length, width, height, spectral_bins)
+
+
 def main() -> None:
     args = parse_args()
     feature_dir = resolve(args.feature_dir)
@@ -160,8 +226,10 @@ def main() -> None:
     with h5py.File(data_path, "r") as handle:
         for row in tqdm(sequences.itertuples(index=False), total=len(sequences), desc="event-stats"):
             group = handle[row.rec_name][row.roi_key]
-            values = sequence_features(
-                np.asarray(group["events"]),
+            # Pásase o dataset SEN ler: `np.asarray(group["events"])` cargaba os eventos enteiros,
+            # e hai vídeos de 1.600 millóns de eventos (25,8 GB) que mataban o proceso por OOM.
+            values = sequence_features_chunked(
+                group["events"],
                 int(row.length),
                 float(base_metadata["grid_stride_s"]),
                 int(group.attrs["width"]),
@@ -173,11 +241,23 @@ def main() -> None:
     finite = np.isfinite(matrix).all(axis=1)
     if not finite.all():
         raise ValueError(f"Event-stat cache has {int((~finite).sum())} invalid rows")
-    mean = np.asarray(matrix, dtype=np.float64).mean(axis=0)
-    std = np.asarray(matrix, dtype=np.float64).std(axis=0)
+    # As estatísticas de normalización axústanse SÓ con train+val. Incluír o test faría que a
+    # normalización da rama de eventos dependese do conxunto de avaliación: é transdución, aínda
+    # que non use etiquetas, e un revisor pode sinalala con razón.
+    fit_mask = np.zeros(len(matrix), dtype=bool)
+    for row in sequences.itertuples(index=False):
+        if str(row.split) != "test":
+            fit_mask[int(row.offset) : int(row.offset + row.length)] = True
+    if not fit_mask.any():
+        raise ValueError("Non hai filas de train/val coas que axustar a normalización")
+    fit_rows = np.asarray(matrix[fit_mask], dtype=np.float64)
+    mean = fit_rows.mean(axis=0)
+    std = fit_rows.std(axis=0)
     std[std < 1e-6] = 1.0
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
+        "normalisation_fit_splits": ["train", "val"],
+        "normalisation_fit_rows": int(fit_mask.sum()),
         "feature_names": FEATURE_NAMES,
         "feature_dim": len(FEATURE_NAMES),
         "num_points": len(matrix),

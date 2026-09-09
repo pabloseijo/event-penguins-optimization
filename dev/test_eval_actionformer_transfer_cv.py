@@ -1,21 +1,12 @@
-"""Tests for the class-wise ranking and calibration used in transfer evaluation.
-
-Checks that percentile ranks average ties, that class-wise ranks never mix
-classes, that the ECDF is fitted on training values only, and that the duration
-penalty acts on the upper tail alone.
-"""
-
 import unittest
 
 import numpy as np
 import torch
 
 from eval_actionformer_transfer_cv import (
-    apply_classwise_ecdf,
     classwise_percentile_ranks,
     classwise_segment_voting,
     duration_penalty,
-    fit_classwise_ecdf,
     percentile_rank,
 )
 
@@ -41,25 +32,6 @@ class EvalActionFormerTransferCvTest(unittest.TestCase):
         ranks = classwise_percentile_ranks(videos, values)
         np.testing.assert_allclose(ranks[0], [0.5, 0.5])
         np.testing.assert_allclose(ranks[1], [1.0, 1.0])
-
-    def test_classwise_ecdf_is_fitted_only_on_training_values(self):
-        training = [
-            {
-                "labels": np.asarray([0, 0, 1, 1]),
-            }
-        ]
-        references = fit_classwise_ecdf(
-            training,
-            [np.asarray([0.1, 0.2, 100.0, 200.0])],
-            num_classes=2,
-        )
-        validation = [{"labels": np.asarray([0, 1])}]
-        ranks = apply_classwise_ecdf(
-            validation,
-            [np.asarray([0.15, 150.0])],
-            references,
-        )
-        np.testing.assert_allclose(ranks[0], [0.5, 0.5])
 
     def test_duration_penalty_only_affects_upper_tail(self):
         video = {

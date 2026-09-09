@@ -38,7 +38,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--context-ratio", type=float, default=0.5)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--inference-only", action="store_true")
     return parser.parse_args()
 
 
@@ -224,22 +223,12 @@ def load_ground_truth(
     return ground_truth, raw
 
 
-def load_split_video_ids(annotation_path: Path, split: str) -> set:
-    raw = json.loads(annotation_path.read_text(encoding="utf-8"))
-    return {
-        video_id
-        for video_id, video in raw["database"].items()
-        if str(video.get("subset", "")).lower() == split.lower()
-    }
-
-
 def prepare_video(
     raw: Mapping[str, np.ndarray],
     gt_segments: np.ndarray,
     gt_labels: np.ndarray,
     *,
     context_ratio: float,
-    include_target: bool = True,
 ) -> Dict[str, np.ndarray]:
     segments = raw["segments"].astype(np.float32)
     video_duration = float(raw["video_duration"])
@@ -274,7 +263,7 @@ def prepare_video(
             statistics["end_contrast"],
         )
     ).astype(np.float32)
-    prepared = {
+    return {
         "video_id": raw["video_id"],
         "video_duration": raw["video_duration"],
         "segments": segments,
@@ -284,34 +273,20 @@ def prepare_video(
         "labels": labels,
         "features": features,
         "feature_names": np.asarray(FEATURE_NAMES),
-    }
-    if include_target:
-        prepared["target_tiou"] = quality_targets(
+        "target_tiou": quality_targets(
             clipped_segments, labels, gt_segments, gt_labels
-        )
-    return prepared
+        ),
+    }
 
 
 def main() -> None:
     args = parse_args()
-    if args.split.lower() == "test" and not args.inference_only:
-        raise ValueError(
-            "Refusing to create target_tiou from test annotations; "
-            "use --inference-only"
-        )
-    if args.inference_only:
-        expected_video_ids = load_split_video_ids(
-            args.annotations, args.split
-        )
-        ground_truth = {}
-    else:
-        ground_truth, _ = load_ground_truth(args.annotations, args.split)
-        expected_video_ids = set(ground_truth)
+    ground_truth, _ = load_ground_truth(args.annotations, args.split)
     raw_paths = sorted(args.raw_dir.glob("*.npz"))
     raw_video_ids = {path.stem for path in raw_paths}
-    if raw_video_ids != expected_video_ids:
-        missing = sorted(expected_video_ids - raw_video_ids)
-        extra = sorted(raw_video_ids - expected_video_ids)
+    if raw_video_ids != set(ground_truth):
+        missing = sorted(set(ground_truth) - raw_video_ids)
+        extra = sorted(raw_video_ids - set(ground_truth))
         raise ValueError(
             f"Raw export/split mismatch; missing={missing}, extra={extra}"
         )
@@ -326,19 +301,12 @@ def main() -> None:
             continue
         with np.load(raw_path) as raw_file:
             raw = {name: raw_file[name] for name in raw_file.files}
-        gt_segments, gt_labels = ground_truth.get(
-            raw_path.stem,
-            (
-                np.empty((0, 2), dtype=np.float32),
-                np.empty(0, dtype=np.int64),
-            ),
-        )
+        gt_segments, gt_labels = ground_truth[raw_path.stem]
         prepared = prepare_video(
             raw,
             gt_segments,
             gt_labels,
             context_ratio=args.context_ratio,
-            include_target=not args.inference_only,
         )
         np.savez_compressed(output_path, **prepared)
         counts[raw_path.stem] = int(prepared["segments"].shape[0])
@@ -352,9 +320,7 @@ def main() -> None:
         "feature_names": list(FEATURE_NAMES),
         "videos": len(counts),
         "candidates": sum(counts.values()),
-        "inference_only": bool(args.inference_only),
-        "targets_written": not args.inference_only,
-        "target_uses_test": False,
+        "target_uses_test": args.split.lower() == "test",
     }
     (args.output_dir / "metadata.json").write_text(
         json.dumps(report, indent=2) + "\n",
